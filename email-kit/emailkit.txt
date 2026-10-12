@@ -9,6 +9,7 @@
   emailkit qa --rules | --explain RULE             rule list / one rule's fix
   emailkit render out.html [--vars f] [--shots DIR] [--sbs ref.png out.png]   needs playwright+chromium (exit 3 = skipped)
   emailkit measure shot.png [--width 600] [--crops DIR]                       needs pillow+numpy (exit 3 = skipped)
+  emailkit verify out.html saved.html [--lenient]            compare the template READ BACK from the platform with what was built (block refs: count, order, position)
   emailkit placeholder W H out.png [--scale 2] [--color D9DEE3]                flat PNG, stdlib only
 Run as:  python3 "$EK" <command> ...   ($EK = path of this file; the extension does not matter)
 Exit codes: 0 ok, 1 FAIL found, 2 usage error, 3 capability missing (report the check as skipped).
@@ -59,6 +60,8 @@ RULES = {
  "JINJA-SYNTAX":("FAIL","Jinja syntax", "Fix the syntax error (unknown tags are warnings: MoEngage may add custom tags)."),
  "JINJA-BRANCH":("WARN","Branch opens/closes tags unevenly", "Open and close table/tr/td inside the same if/for branch."),
  "SPAMCOPY":   ("WARN", "Spam-trigger copy", "Remove ALL-CAPS shouting, repeated !!!/$$$, and trigger phrases (act now, risk-free, 100% free, winner...). Judge in context."),
+ "FOSTER":     ("FAIL", "Content that browsers will move out of its table", "Text, tokens or elements placed directly inside <table>/<tr> are hoisted before the table by HTML parsers (the dashboard preview, Froala, Gmail web): content blocks and tokens end up at the top. Put every token and element inside a <td>. Pure {% %} statements between rows only warn."),
+ "LINKCOLOR":  ("FAIL", "Link without its own inline colour", "Every <a href> needs color in its own inline style; clients ignore the colour of the parent cell and apply their default link blue (blue text on a black button)."),
  "LINKCHECK":  ("SEND", "Broken link or image", "Fix or replace the URL. 401/403/429 are reported as unverified, not broken."),
 }
 SHORTENERS = {"bit.ly","t.co","tinyurl.com","goo.gl","ow.ly","is.gd","buff.ly","rebrand.ly","cutt.ly","tiny.cc"}
@@ -69,7 +72,7 @@ TRACKED = {"html","head","body","title","style","table","thead","tbody","tr","td
            "h1","h2","h3","h4","h5","h6","ul","ol","li","b","strong","em","i","u","center"}
 BANNED_TAGS = {"script","form","input","button","select","textarea","video","audio","iframe","object","embed","canvas","svg","base"}
 WEBSAFE = ("arial","helvetica","georgia","times new roman","courier new","courier","verdana","tahoma","trebuchet ms","sans-serif","serif","monospace")
-SELF_TAGS = re.compile(r"unsubscribe|preference|moe_|webview|view_in_browser|viewinbrowser|browser", re.I)
+SELF_TAGS = re.compile(r"unsubscribe|preference|moe_|webview|view_in_browser|viewinbrowser|browser|contentblock|content_block", re.I)
 
 # ---------------------------------------------------------------- DOM
 class Node:
@@ -180,6 +183,7 @@ def lightness(rgb): return colorsys.rgb_to_hls(*(c / 255 for c in rgb))[1]
 def hexc(rgb): return "#%02x%02x%02x" % rgb
 
 def eff_color(n):
+    if n.tag == "a" and "color" not in style_of(n): return (0, 0, 238)   # browsers/clients do not inherit link colour from the parent
     for a in anc(n):
         c = parse_color(style_of(a).get("color", ""))
         if c: return c
@@ -275,6 +279,29 @@ class QA:
         p = n.parent
         while p is not None and p.tag != "table": p = p.parent
         return p
+
+    def foster(self):
+        ctx = {"table", "tbody", "thead", "tfoot", "tr"}; ok_kids = {"table": {"tbody", "thead", "tfoot", "tr", "caption", "colgroup", "col"}, "tbody": {"tr"}, "thead": {"tr"}, "tfoot": {"tr"}, "tr": {"td", "th"}}
+        bad = stm = 0
+        for n in self.nodes:
+            if n.tag not in ctx: continue
+            for k in n.kids:
+                if isinstance(k, str):
+                    t = htmllib.unescape(k); left = real(re.sub(r"\{%.*?%\}|\{#.*?#\}", "", t, flags=re.S))
+                    if left:
+                        bad += 1
+                        if bad <= 3: self.add("FOSTER", f"text/token '{left[:50]}' directly inside <{n.tag}>", n.line)
+                    elif real(t): stm += 1
+                elif k.tag not in ok_kids[n.tag] and k.tag not in ("script", "template"):
+                    bad += 1
+                    if bad <= 3: self.add("FOSTER", f"<{k.tag}> directly inside <{n.tag}>", k.line)
+        if bad > 3: self.add("FOSTER", f"...+{bad - 3} more")
+        if stm: self.add("FOSTER", f"{stm} Jinja statement(s) ({{% %}}) sit directly between table rows: harmless once rendered, but the dashboard preview shows them as stray text above the table", status="WARN")
+
+    def linkcolor(self):
+        bad = [a for a in self.tag("a") if a.attrs.get("href") and "color" not in style_of(a)]
+        for a in bad[:3]: self.add("LINKCOLOR", f"<a href='{a.attrs.get('href', '')[:40]}'> '{real(text_of(a, True))[:25]}' has no inline colour", a.line)
+        if len(bad) > 3: self.add("LINKCOLOR", f"...+{len(bad) - 3} more")
 
     def mso(self):
         o = len(re.findall(r"<!--\[if[^\]]*\]>", self.raw)); c = len(re.findall(r"<!\[endif\]-->", self.raw))
@@ -434,7 +461,7 @@ class QA:
                 v = n.attrs.get(k, "")
                 if v and "{{" not in v and not v.startswith("https://") and n.tag != "a":
                     self.add("URLS", f"{n.tag} {k}='{v[:40]}' is not absolute https", n.line)
-        if self.marketing and not (seen_unsub or re.search(r"\{\{[^}]*unsubscribe[^}]*\}\}", self.raw, re.I)):
+        if self.marketing and not self.a.ref_form and not (seen_unsub or re.search(r"\{\{[^}]*unsubscribe[^}]*\}\}", self.raw, re.I)):
             self.add("UNSUB", "no unsubscribe link or tag found")
         for m in re.finditer(r"\[PLACEHOLDER[^\]]*\]", self.raw): self.add("PLACEHOLDER", m.group(0)[:60])
         self.urls = sorted(set(urls))
@@ -445,7 +472,7 @@ class QA:
             parts = [own_text(n) for n in walk(body[0]) if n.tag not in ("style", "script") and not hidden(n)]
             t = real(" ".join(parts))
         self.metrics["text_chars"] = len(t)
-        if self.marketing and len(t) < 150: self.add("TEXTRATIO", f"only {len(t)} characters of live text")
+        if self.marketing and not self.a.ref_form and len(t) < 150: self.add("TEXTRATIO", f"only {len(t)} characters of live text")
         pre = getattr(self, "preheader_node", None)
         for n in self.nodes:
             if n.tag in ("div", "span", "td", "p") and "none" in style_of(n).get("display", "") and real(text_of(n)) and n is not pre and not any(a is pre for a in anc(n)):
@@ -584,7 +611,7 @@ class QA:
 
     def run(self):
         for f in (self.shell, self.banned, self.tables, self.mso, self.wellformed, self.bgpair, self.reset, self.ghost,
-                  self.fonts, self.preheader, self.buttons, self.overflow, self.text_rules, self.headings, self.images,
+                  self.foster, self.linkcolor, self.fonts, self.preheader, self.buttons, self.overflow, self.text_rules, self.headings, self.images,
                   self.links, self.liveness, self.spamcopy, self.contrast, self.dark, self.size, self.jinja):
             f()
         if self.a.check_links: self.linkcheck()
@@ -596,7 +623,7 @@ def qa_main():
     p.add_argument("file", nargs="?"); p.add_argument("--type", default="marketing", choices=["marketing", "transactional", "alert"])
     p.add_argument("--container", type=int, default=600); p.add_argument("--tracking-overhead", type=int, default=120)
     p.add_argument("--extra-bytes", type=int, default=0); p.add_argument("--check-links", action="store_true")
-    p.add_argument("--json"); p.add_argument("--allow-token", action="append", default=[])
+    p.add_argument("--json"); p.add_argument("--allow-token", action="append", default=[]); p.add_argument("--ref-form", action="store_true", help="QA the saved reference form (content lives in blocks: skips unsubscribe/text-ratio checks)")
     p.add_argument("--rules", action="store_true"); p.add_argument("--explain")
     a = p.parse_args()
     if a.rules:
@@ -638,6 +665,11 @@ section (all take: style:{bg,pad:[t,r,b,l],align,<role>:{size,lh,wt,color,ls,tt}
   divider  {} | spacer {h:24}
   footer   {legal?, address?, links?:[{label,url}], unsubscribe?: url or platform tag}
   raw      {html:'<tr>..</tr>'}                    escape hatch; use --snippet for patterns
+any section may carry  as_block:{name, ref}  to save it as a content block:
+  name = block name; ref = the EXACT reference text from the platform's content-block skill.
+  build writes out.html (expanded: QA/render run on this), out.ref.html (what is saved as the template: the ref replaces
+  the section's rows IN PLACE, so order always equals spec order), out.blocks/<name>.html (the rows to save as the block),
+  and out.order.json. After saving, run:  emailkit verify out.html saved.html
 Strings may contain Jinja tokens; keep each token on one line with default('..') fallbacks."""
 
 DEF = dict(page_bg="#F4F5F7", card_bg="#FFFFFF", text="#1F2933", muted="#52606D", accent="#0B5FFF", btn_fg="#FFFFFF",
@@ -973,13 +1005,26 @@ u + #body a{{color:inherit;text-decoration:none;font-size:inherit;font-family:in
 </html>
 '''
 
-    def build(self):
-        rows = []
-        for s in self.spec["sections"]:
-            fn = getattr(self, "s_" + s["type"], None)
-            if not fn: raise SystemExit(f"unknown section type: {s['type']}")
-            rows.append(fn(s))
-        return self.head() + "\n".join(rows) + "\n" + self.FOOT
+    def build_all(self):
+        exp, ref, blocks, order = [], [], {}, []
+        for i, sec in enumerate(self.spec["sections"]):
+            fn = getattr(self, "s_" + sec["type"], None)
+            if not fn: raise SystemExit(f"unknown section type: {sec['type']}")
+            rows = fn(sec); ab = sec.get("as_block")
+            if ab:
+                name, r = ab.get("name"), ab.get("ref")
+                if not name or not r: raise SystemExit(f"section {i}: as_block needs name and ref")
+                if name in blocks: raise SystemExit(f"duplicate block name {name}")
+                if any(r == b["ref"] for b in blocks.values()): raise SystemExit(f"duplicate block ref {r}")
+                tbl = '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;">' + rows + '</table>'
+                wrap = lambda inner: '<tr><td style="padding:0;">' + inner + '</td></tr>'
+                blocks[name] = {"ref": r, "html": tbl}; exp.append(wrap(tbl)); ref.append(wrap(r))
+            else: exp.append(rows); ref.append(rows)
+            order.append({"index": i, "type": sec["type"], "block": ab["name"] if ab else None})
+        h, f = self.head(), self.FOOT
+        return {"expanded": h + "\n".join(exp) + "\n" + f, "reference": h + "\n".join(ref) + "\n" + f, "blocks": blocks, "order": order}
+
+    def build(self): return self.build_all()["expanded"]
 
 def build_main():
     p = argparse.ArgumentParser(); p.add_argument("spec", nargs="?"); p.add_argument("out", nargs="?")
@@ -992,8 +1037,16 @@ def build_main():
         b = B({"meta": {}, "tokens": tok, "sections": []}); sec = json.loads(a.snippet[1]); sec["type"] = a.snippet[0]
         print(getattr(b, "s_" + sec["type"])(sec)); return
     if not (a.spec and a.out): p.error("spec and out required")
-    html = B(json.load(open(a.spec))).build(); open(a.out, "w", encoding="utf-8").write(html)
+    r = B(json.load(open(a.spec))).build_all(); html = r["expanded"]; open(a.out, "w", encoding="utf-8").write(html)
     print(f"wrote {a.out}: {len(html.encode()) / 1024:.1f} KB")
+    if r["blocks"]:
+        base = a.out[:-5] if a.out.endswith(".html") else a.out
+        os.makedirs(base + ".blocks", exist_ok=True); open(base + ".ref.html", "w", encoding="utf-8").write(r["reference"])
+        for n, b in r["blocks"].items(): open(f"{base}.blocks/{re.sub(r'[^A-Za-z0-9_.-]', '_', n)}.html", "w", encoding="utf-8").write(b["html"])
+        json.dump({"blocks": [{"name": n, "ref": b["ref"], "index": next(o["index"] for o in r["order"] if o["block"] == n)} for n, b in r["blocks"].items()],
+                   "sections": r["order"]}, open(base + ".order.json", "w"), indent=1)
+        print(f"wrote {base}.ref.html (template to SAVE), {base}.blocks/ ({len(r['blocks'])} block files to save), {base}.order.json")
+        print("order: " + " > ".join((o["block"] and "[" + o["block"] + "]") or o["type"] for o in r["order"]))
 
 # ===================== RENDER =====================
 CONTRAST_JS = r"""() => {
@@ -1164,6 +1217,63 @@ def measure_main():
     if o.json: json.dump(out, open(o.json, "w"), indent=1)
 
 # ===================== PROBE / PLACEHOLDER / DISPATCH =====================
+def verify_main():
+    a = argparse.ArgumentParser(prog="emailkit verify"); a.add_argument("built", help="out.html from build (expects out.ref.html, out.order.json, out.blocks/ beside it)")
+    a.add_argument("saved", help="HTML of the template as READ BACK from the platform after saving"); a.add_argument("--lenient", action="store_true", help="do not require identical surrounding HTML, only block count/order/position")
+    o = a.parse_args(); base = o.built[:-5] if o.built.endswith(".html") else o.built
+    try: order = json.load(open(base + ".order.json")); intended = open(base + ".ref.html", encoding="utf-8").read(); expanded = open(o.built, encoding="utf-8").read()
+    except FileNotFoundError as e: print("FAIL verify: missing build output", e.filename, "(was a block section built with as_block?)"); return 1
+    saved = open(o.saved, encoding="utf-8").read(); blocks = order["blocks"]; fails, notes = [], []
+    norm = lambda t: re.sub(r">\s+<", "><", re.sub(r"\s+", " ", t)).strip()
+    rows_before = lambda t, pos: len(re.findall(r"<tr[\s>]", re.sub(r"<!--.*?-->", "", t[:pos], flags=re.S)))
+    body = saved.lower().find("<body"); positions = []
+    for b in blocks:
+        c = saved.count(b["ref"]); pos = saved.find(b["ref"]); positions.append(pos)
+        if c != 1: fails.append(f"block {b['name']}: reference appears {c} times in the saved template (need exactly 1)"); continue
+        if 0 <= body > pos: fails.append(f"block {b['name']}: reference is placed BEFORE <body>")
+        want, got = rows_before(intended, intended.find(b["ref"])), rows_before(saved, pos)
+        if want != got: fails.append(f"block {b['name']}: {got} table rows precede it in the saved template, design/spec order needs {want}")
+        else: notes.append(f"{b['name']}: position ok ({got} rows before it)")
+    found = [p for p in positions if p >= 0]
+    if found != sorted(found): fails.append("block references are in a different order than the spec: saved order = " + ", ".join(b["name"] for _, b in sorted(zip(positions, blocks), key=lambda x: x[0])))
+    def skel(t):
+        for i, b in enumerate(blocks): t = t.replace(b["ref"], f"\x00{i}\x00")
+        return norm(t)
+    s1, s2 = skel(intended), skel(saved)
+    if s1 != s2:
+        i = next((k for k, (x, y) in enumerate(zip(s1, s2)) if x != y), min(len(s1), len(s2)))
+        msg = f"saved template differs from the intended reference form at char {i}: intended ...{s1[max(0, i - 40):i + 60]!r} saved ...{s2[max(0, i - 40):i + 60]!r}"
+        (notes if o.lenient else fails).append(("(lenient) " if o.lenient else "") + msg)
+    exp2 = saved
+    for b in blocks:
+        f = f"{base}.blocks/{re.sub(r'[^A-Za-z0-9_.-]', '_', b['name'])}.html"
+        try: exp2 = exp2.replace(b["ref"], open(f, encoding="utf-8").read())
+        except FileNotFoundError: fails.append("missing block file " + f)
+    if norm(exp2) != norm(expanded) and not fails and not o.lenient: fails.append("saved template with blocks expanded does not equal the validated expanded HTML")
+    # real-browser check: how the dashboard preview parses the saved (unresolved) template
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            br = pw.chromium.launch(); pg = br.new_page(viewport={"width": 800, "height": 900}); pg.set_content(saved)
+            res = pg.evaluate("""(refs) => { const cont = document.querySelector('table.mx-full') || [...document.querySelectorAll('table')].sort((a, b) => b.getBoundingClientRect().width - a.getBoundingClientRect().width)[0];
+               const cr = cont ? cont.getBoundingClientRect() : null; return refs.map(r => { const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                 while (w.nextNode()) { const i = w.currentNode.textContent.indexOf(r); if (i >= 0) { const g = document.createRange(); g.setStart(w.currentNode, i); g.setEnd(w.currentNode, i + r.length);
+                   const c = g.getBoundingClientRect(); return {y: c.top, inside: !cr || (c.top >= cr.top - 1 && c.bottom <= cr.bottom + 1 && c.left >= cr.left - 1 && c.right <= cr.right + 1)}; } } return null; }); }""", [b["ref"] for b in blocks])
+            br.close()
+        ys = []
+        for b, r in zip(blocks, res):
+            if r is None: fails.append(f"preview parse: block {b['name']} reference not found in the rendered page"); continue
+            if not r["inside"]: fails.append(f"preview parse: block {b['name']} reference renders OUTSIDE the email container (a browser moved it out of its table)")
+            ys.append(r["y"])
+        if ys != sorted(ys): fails.append("preview parse: block references render in a different vertical order than the spec")
+        if not any(f.startswith("preview parse") for f in fails): notes.append("preview parse: all block references render inside the container, in spec order (Chromium)")
+    except ImportError: notes.append("preview parse: skipped (playwright not installed)")
+    except Exception as e: notes.append("preview parse: skipped (" + type(e).__name__ + ")")
+    for f in fails: print("FAIL", f)
+    for n in notes: print("NOTE", n)
+    print(f"-- verify: {len(fails)} FAIL, {len(blocks)} block(s) checked; order = " + " > ".join((x["block"] and "[" + x["block"] + "]") or x["type"] for x in order["sections"]))
+    return 1 if fails else 0
+
 def probe_main():
     rows = [("python", "ON", platform.python_version())]
     try:
@@ -1198,7 +1308,7 @@ def placeholder_main():
     open(o.out, "wb").write(png); print(f"{o.out}: {W}x{H}px, {len(png)} bytes"); return 0
 
 def main():
-    cmds = {"build": build_main, "qa": qa_main, "render": render_main, "measure": measure_main, "probe": probe_main, "placeholder": placeholder_main}
+    cmds = {"build": build_main, "verify": verify_main, "qa": qa_main, "render": render_main, "measure": measure_main, "probe": probe_main, "placeholder": placeholder_main}
     if len(sys.argv) < 2 or sys.argv[1] not in cmds:
         print(__doc__); return 2
     cmd = sys.argv[1]; sys.argv = [f"emailkit {cmd}"] + sys.argv[2:]

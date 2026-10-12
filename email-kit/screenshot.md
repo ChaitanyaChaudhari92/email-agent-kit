@@ -1,0 +1,14 @@
+# Screenshot mode
+
+A screenshot is a **measured reference, not a pixel source**. Measure with code, label confidence, and never reuse its pixels as email assets.
+
+1. **Classify and pair.** Desktop, mobile, dark-themed, or app/browser chrome. A desktop + mobile pair of one email = one template with a mobile reference; light + dark of one email = one template with a dark reference; others are separate templates. A dark-only screenshot is the base as shown; derive the other mode (instructions §9). Crop away chrome/gutters first.
+2. **Scale.** Width 560–700 → ratio 1, `width` = that (snap to 600 if within ±20). 1120–1400 → ratio 2. 750/828/1080/1125/1170/1242/1284 → mobile capture (logical width = width ÷ ratio). Mobile-only → one fluid 600 container using mobile values 1:1 (log "no desktop reference"). Anything else → normalise to 600 and flag reduced fidelity.
+3. **Measure.** `python3 "$EK" measure shot.png --width 600 --crops /tmp/crops` prints, per band: y range, background hex, padding, column count/widths, text-line heights and pitch, dominant ink colours. It is heuristic (bands split on background change or ≥32 px blank gaps): merge or split bands by judgement.
+4. **Read each band** (view one crop at a time): transcribe text exactly; identify buttons (box, fill, radius, label), images/icons/logos (position only), links as shown.
+5. **Estimate type:** font-size ≈ cap-height ÷ 0.71 (Helvetica/Arial-like) or from line pitch; line-height = baseline pitch; weight regular/bold from stroke thickness; snap to 12, 13, 14, 16, 18, 20, 24, 28, 32, 36, 40. Snap spacing to a 2 px grid (4 px ≥24). Colours: use the **sampled hex exactly**. Classify serif/sans/mono; never claim a font name unless stated.
+6. **Build the spec** like Figma mode (tokens from the most frequent colours/sizes; sections via the mapping table in `figma.md` §4, read only that table). Images and logos become **slots**: use the brand's registry/hosted logo if one exists, or a user-supplied file (host it), else a placeholder (below). Mark the template `fidelity: approximate`.
+7. **Placeholders:** create it with `python3 "$EK" placeholder <w> <h> <name>.png` (flat `#D9DEE3`, 2×), host it, name it `placeholder-<w>x<h>@2x-<hash8>.png`; it is a blocking-for-send item.
+8. **Fidelity check:** `emailkit render out.html --sbs shot.png sbs.png`, view once, patch the spec. Thresholds are looser than Figma: geometry ±6 px, flat colours should match closely, text may wrap differently with fallback fonts.
+9. **Report** the count of `estimated`/`assumed` values and the list of placeholder slots. If the screenshot belongs to another brand, take style only; never copy its logo, imagery or copy.
+10. Unreadable screenshot (<320 px wide, heavily compressed): proceed at the lowest fidelity, flag prominently, do not ask.

@@ -1,0 +1,1208 @@
+#!/usr/bin/env python3
+"""emailkit: single-file toolkit for the MoEngage email template agent (stdlib only for build/qa/probe/placeholder).
+
+  emailkit probe                                   capability table (python, jinja2, pillow/numpy, chromium, network)
+  emailkit build spec.json out.html                spec JSON -> production HTML (patterns built in)
+  emailkit build --schema | --example              print the spec schema / a complete example spec
+  emailkit build --snippet TYPE 'JSON' [--tokens f]  one section's <tr> rows (for a raw section)
+  emailkit qa out.html [--type marketing|transactional|alert] [--check-links] [--extra-bytes N] [--json f]
+  emailkit qa --rules | --explain RULE             rule list / one rule's fix
+  emailkit render out.html [--vars f] [--shots DIR] [--sbs ref.png out.png]   needs playwright+chromium (exit 3 = skipped)
+  emailkit measure shot.png [--width 600] [--crops DIR]                       needs pillow+numpy (exit 3 = skipped)
+  emailkit placeholder W H out.png [--scale 2] [--color D9DEE3]                flat PNG, stdlib only
+Run as:  python3 "$EK" <command> ...   ($EK = path of this file; the extension does not matter)
+Exit codes: 0 ok, 1 FAIL found, 2 usage error, 3 capability missing (report the check as skipped).
+Rule changes belong here, not in the prompt.
+"""
+import argparse, colorsys, concurrent.futures as cf, html as htmllib, json, math, os, platform, re, struct, sys, zlib
+import urllib.error, urllib.request
+from html.parser import HTMLParser
+from urllib.parse import urlparse
+
+# ===================== QA =====================
+# ---------------------------------------------------------------- rules
+RULES = {
+ "SHELL":      ("FAIL", "Document shell", "Build with emailkit build (do not hand-write the shell): doctype, <html lang dir>, charset, viewport, non-empty <title>."),
+ "BANNED":     ("FAIL", "Banned element or at-rule", "Remove script/form/input/button/select/textarea/video/audio/iframe/object/embed/canvas/svg/<link stylesheet>/@import/meta refresh."),
+ "LAYOUTCSS":  ("FAIL", "Banned layout CSS", "No position, float, flex, grid, calc(), var(). Use tables (display:inline-block only in the columns section)."),
+ "UNITS":      ("FAIL", "Relative units", "Use px (and % for widths). No rem/em/vw/vh."),
+ "TABLES":     ("FAIL", "Layout table attributes", "Layout tables need role=presentation cellpadding=0 cellspacing=0 border=0. Data tables use <th scope> and no role=presentation."),
+ "MSO":        ("FAIL", "Unbalanced MSO conditionals", "Every <!--[if ...]> needs <![endif]-->; every <!--[if !mso]><!-- --> needs <!--<![endif]-->."),
+ "WELLFORMED": ("FAIL", "Not well-formed", "Close every tag; no stray end tags."),
+ "BGPAIR":     ("WARN", "Background colour set once", "Set both bgcolor attribute and CSS background-color."),
+ "URLS":       ("FAIL", "URL not absolute https", "All href/src/background must be absolute https (mailto/tel/sms allowed)."),
+ "IMGS":       ("FAIL", "Image attributes", "Every <img> needs alt (empty if decorative), width and height attributes (display size) and display:block."),
+ "FONTS":      ("FAIL", "Font stack without generic fallback", "End every font-family with sans-serif, serif or monospace."),
+ "RESET":      ("WARN", "Reset block incomplete", "Build with emailkit build, which includes the reset: text-size-adjust, mso-table-lspace, x-apple-data-detectors, x-apple-disable-message-reformatting, format-detection, PixelsPerInch."),
+ "PREHEADER":  ("FAIL", "Preheader", "First element in the wrapper, hidden with display:none + mso-hide:all, 40-130 real characters (set meta.preheader in the spec)."),
+ "GHOST":      ("FAIL", "No MSO ghost table", "Container with max-width needs the <!--[if mso]> ghost table (emailkit build emits it)."),
+ "BUTTON":     ("FAIL", "Button not bulletproof or too small", "Use emailkit build button (VML roundrect + CSS <a>): button h >= 44."),
+ "OVERFLOW":   ("FAIL", "Fixed width wider than container", "No width greater than the container (default 600); use width:100%;max-width:Npx."),
+ "SMALLTEXT":  ("WARN", "Text under 12px", "Body text >=14px. Only legal/footer may be 12px."),
+ "FIXEDH":     ("WARN", "Fixed height on text container", "Remove fixed height from elements holding text (spacers excepted)."),
+ "HEADINGS":   ("WARN", "Heading structure", "Exactly one <h1>; do not skip levels; headings only for real headings."),
+ "ALT":        ("WARN", "Alt text quality", "Alt must not start with 'image of'/'picture of' or be a filename."),
+ "LINKTEXT":   ("FAIL", "Empty or non-descriptive link", "Links need descriptive text (or a functional alt on an image link); avoid bare 'click here' / 'read more'."),
+ "CONTRAST":   ("WARN", "Low contrast", "Text >=4.5:1 (>=3:1 large). Design-caused failures: log, do not change brand colours."),
+ "DARKCFG":    ("FAIL", "Dark-mode configuration", "Add color-scheme metas, :root color-scheme, @media (prefers-color-scheme:dark) with mx- hooks, and [data-ogsc]/[data-ogsb] (emailkit build emits these)."),
+ "ASSETHOST":  ("FAIL", "Image hosting or format", "Images on MoEngage hosting only; no figma/amazonaws hosts, data: URIs, svg/webp/avif."),
+ "SHORTENER":  ("FAIL", "URL shortener or forbidden scheme", "No bit.ly/t.co/tinyurl/goo.gl/ow.ly links, no javascript:/data:."),
+ "PLACEHOLDER":("SEND", "Placeholder present", "Replace [PLACEHOLDER...], placeholder.invalid links and placeholder images before sending."),
+ "MISMATCH":   ("FAIL", "Link text host differs from href host", "Visible URL-like link text must match the href host."),
+ "UNSUB":      ("FAIL", "No unsubscribe link (marketing)", "Set footer.unsubscribe to the platform unsubscribe tag/URL."),
+ "TEXTRATIO":  ("WARN", "Too little live text", "Marketing emails need >=150 characters of live text; no image-only emails."),
+ "HIDDEN":     ("WARN", "Hidden text besides preheader", "Only the preheader may be hidden text."),
+ "SIZE":       ("FAIL", "Gmail clipping risk", "Estimated delivered size must be <=102 KB (target <=90 KB). Trim CSS/markup."),
+ "STYLESIZE":  ("FAIL", "<style> over 16 KB", "Keep embedded CSS <=16 KB; inline critical CSS."),
+ "JINJA-FALLBACK": ("FAIL", "Variable without fallback", "Wrap every variable: default('x') (add , true for empty strings) or guard with {% if %}."),
+ "JINJA-TOKEN":("FAIL", "Unsafe Jinja token", "Keep each token on one line, no HTML inside, no raw < or > (use lt/gt/le/ge), use false not null."),
+ "JINJA-SYNTAX":("FAIL","Jinja syntax", "Fix the syntax error (unknown tags are warnings: MoEngage may add custom tags)."),
+ "JINJA-BRANCH":("WARN","Branch opens/closes tags unevenly", "Open and close table/tr/td inside the same if/for branch."),
+ "SPAMCOPY":   ("WARN", "Spam-trigger copy", "Remove ALL-CAPS shouting, repeated !!!/$$$, and trigger phrases (act now, risk-free, 100% free, winner...). Judge in context."),
+ "LINKCHECK":  ("SEND", "Broken link or image", "Fix or replace the URL. 401/403/429 are reported as unverified, not broken."),
+}
+SHORTENERS = {"bit.ly","t.co","tinyurl.com","goo.gl","ow.ly","is.gd","buff.ly","rebrand.ly","cutt.ly","tiny.cc"}
+BAD_IMG_HOSTS = ("figma.com", "figma-alpha", "amazonaws.com")
+BAD_IMG_EXT = (".svg", ".webp", ".avif")
+VOID = {"meta","link","img","br","hr","input","base","col","area","source","track","wbr","embed","param"}
+TRACKED = {"html","head","body","title","style","table","thead","tbody","tr","td","th","div","p","a","span",
+           "h1","h2","h3","h4","h5","h6","ul","ol","li","b","strong","em","i","u","center"}
+BANNED_TAGS = {"script","form","input","button","select","textarea","video","audio","iframe","object","embed","canvas","svg","base"}
+WEBSAFE = ("arial","helvetica","georgia","times new roman","courier new","courier","verdana","tahoma","trebuchet ms","sans-serif","serif","monospace")
+SELF_TAGS = re.compile(r"unsubscribe|preference|moe_|webview|view_in_browser|viewinbrowser|browser", re.I)
+
+# ---------------------------------------------------------------- DOM
+class Node:
+    __slots__ = ("tag", "attrs", "parent", "kids", "line")
+    def __init__(self, tag, attrs, parent, line):
+        self.tag, self.attrs, self.parent, self.kids, self.line = tag, attrs, parent, [], line
+
+class Builder(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.root = Node("#root", {}, None, 1); self.cur = self.root
+        self.errors = []; self.doctype = None
+    def handle_decl(self, d): self.doctype = d
+    def handle_starttag(self, tag, attrs):
+        n = Node(tag, {k: (v if v is not None else "") for k, v in attrs}, self.cur, self.getpos()[0])
+        self.cur.kids.append(n)
+        if tag not in VOID: self.cur = n
+    def handle_startendtag(self, tag, attrs):
+        n = Node(tag, {k: (v if v is not None else "") for k, v in attrs}, self.cur, self.getpos()[0])
+        self.cur.kids.append(n)
+    def handle_endtag(self, tag):
+        if tag in VOID: return
+        n = self.cur
+        while n is not None and n.tag != tag: n = n.parent
+        if n is None or n is self.root:
+            if tag in TRACKED: self.errors.append((self.getpos()[0], f"stray </{tag}>"))
+            return
+        k = self.cur
+        while k is not n:
+            if k.tag in TRACKED: self.errors.append((k.line, f"<{k.tag}> not closed"))
+            k = k.parent
+        self.cur = n.parent
+    def handle_data(self, d): self.cur.kids.append(d)
+    def handle_entityref(self, name): self.cur.kids.append(f"&{name};")
+    def handle_charref(self, name): self.cur.kids.append(f"&#{name};")
+    def close(self):
+        super().close()
+        k = self.cur
+        while k is not self.root:
+            if k.tag in TRACKED: self.errors.append((k.line, f"<{k.tag}> not closed"))
+            k = k.parent
+
+def walk(n):
+    for k in n.kids:
+        if isinstance(k, Node):
+            yield k
+            yield from walk(k)
+
+def text_of(n, alts=False):
+    out = []
+    for k in n.kids:
+        if isinstance(k, str): out.append(k)
+        elif k.tag in ("style", "script", "title"): continue
+        else:
+            if alts and k.tag == "img": out.append(k.attrs.get("alt", ""))
+            out.append(text_of(k, alts))
+    return htmllib.unescape("".join(out))
+
+def own_text(n):
+    return htmllib.unescape("".join(k for k in n.kids if isinstance(k, str)))
+
+ZW = dict.fromkeys(map(ord, "\u200c\u200b\u200d\u00a0\ufeff\u034f\u2060"), None)
+def real(s): return re.sub(r"\s+", " ", s.translate(ZW)).strip()
+
+def style_of(n):
+    d = {}
+    for m in re.finditer(r"([\w-]+)\s*:\s*([^;]+)", n.attrs.get("style", "")):
+        d[m.group(1).lower()] = m.group(2).strip()
+    return d
+
+def hidden(n):
+    while n is not None and n.tag != "#root":
+        if re.sub(r"\s", "", style_of(n).get("display", "")).startswith("none"): return True
+        n = n.parent
+    return False
+
+def anc(n):
+    while n is not None and n.tag != "#root":
+        yield n; n = n.parent
+
+# ---------------------------------------------------------------- colour
+NAMED = {"white": "#ffffff", "black": "#000000"}
+def parse_color(v):
+    if not v or "{{" in v or "{%" in v: return None
+    v = v.lower().split("!")[0].strip()
+    v = NAMED.get(v, v)
+    m = re.fullmatch(r"#([0-9a-f]{3}|[0-9a-f]{6})", v)
+    if m:
+        h = m.group(1); h = "".join(c * 2 for c in h) if len(h) == 3 else h
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    m = re.fullmatch(r"rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)", v.split(")")[0] + ")") if v.startswith("rgb") else None
+    return tuple(int(m.group(i)) for i in (1, 2, 3)) if m else None
+
+def lum(rgb):
+    def f(c):
+        c /= 255; return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = map(f, rgb); return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+def ratio(a, b):
+    la, lb = lum(a), lum(b); hi, lo = max(la, lb), min(la, lb)
+    return (hi + 0.05) / (lo + 0.05)
+
+def invert(rgb):
+    h, l, s = colorsys.rgb_to_hls(*(c / 255 for c in rgb))
+    return tuple(round(c * 255) for c in colorsys.hls_to_rgb(h, 1 - l, s))
+
+def lightness(rgb): return colorsys.rgb_to_hls(*(c / 255 for c in rgb))[1]
+def hexc(rgb): return "#%02x%02x%02x" % rgb
+
+def eff_color(n):
+    for a in anc(n):
+        c = parse_color(style_of(a).get("color", ""))
+        if c: return c
+    return (0, 0, 0)
+
+def eff_bg(n):
+    for a in anc(n):
+        s = style_of(a)
+        c = parse_color(s.get("background-color", "")) or parse_color(a.attrs.get("bgcolor", ""))
+        if c: return c
+    return (255, 255, 255)
+
+def font_info(n):
+    size, bold = None, False
+    for a in anc(n):
+        s = style_of(a)
+        if size is None:
+            m = re.match(r"([\d.]+)px", s.get("font-size", ""))
+            if m: size = float(m.group(1))
+        w = s.get("font-weight", "")
+        if w in ("bold", "bolder") or (w.isdigit() and int(w) >= 600): bold = True
+        if a.tag in ("h1", "h2", "h3", "h4", "h5", "h6", "b", "strong"): bold = True
+    return size or 16.0, bold
+
+# ---------------------------------------------------------------- checker
+class QA:
+    def __init__(self, raw, a):
+        self.raw, self.a = raw, a
+        self.items = []   # (rule, status, msg, line)
+        self.metrics = {}
+        b = Builder(); b.feed(raw); b.close()
+        self.b, self.root = b, b.root
+        self.nodes = list(walk(b.root))
+        self.style_texts = [text_of(n) if False else "".join(k for k in n.kids if isinstance(k, str)) for n in self.nodes if n.tag == "style"]
+        self.css = "\n".join(self.style_texts)
+        self.marketing = a.type == "marketing"
+
+    def add(self, rule, msg, line=None, status=None):
+        self.items.append((rule, status or RULES[rule][0], msg, line))
+
+    def tag(self, t): return [n for n in self.nodes if n.tag == t]
+
+    # -- structure
+    def shell(self):
+        html = self.tag("html"); head = self.tag("head")
+        if not (self.b.doctype or "").lower().startswith("doctype html"): self.add("SHELL", "missing <!DOCTYPE html>")
+        if not html: self.add("SHELL", "missing <html>")
+        else:
+            if not html[0].attrs.get("lang"): self.add("SHELL", "<html> has no lang", html[0].line)
+            if not html[0].attrs.get("dir"): self.add("SHELL", "<html> has no dir", html[0].line, "WARN")
+        title = self.tag("title")
+        if not title or not real(text_of(title[0])): self.add("SHELL", "empty or missing <title>")
+        metas = [n.attrs for n in self.tag("meta")]
+        if not any("charset" in m for m in metas): self.add("SHELL", "missing <meta charset>")
+        if not any(m.get("name") == "viewport" for m in metas): self.add("SHELL", "missing viewport meta")
+        wr = [n for n in self.tag("div") if n.attrs.get("lang")]
+        if not wr: self.add("SHELL", "no wrapper <div lang dir role=article> (some clients strip <html> attributes)", status="WARN")
+
+    def banned(self):
+        for n in self.nodes:
+            if n.tag in BANNED_TAGS: self.add("BANNED", f"<{n.tag}>", n.line)
+            if n.tag == "link" and "stylesheet" in n.attrs.get("rel", "").lower(): self.add("BANNED", "<link rel=stylesheet>", n.line)
+            if n.tag == "meta" and n.attrs.get("http-equiv", "").lower() == "refresh": self.add("BANNED", "meta refresh", n.line)
+        if re.search(r"@import", self.css): self.add("BANNED", "@import in <style>")
+        blobs = [(n.line, n.attrs["style"]) for n in self.nodes if "style" in n.attrs] + [(None, self.css)]
+        seen = set()
+        for line, s in blobs:
+            for pat, rule, label in [
+                (r"(?<![\w-])position\s*:", "LAYOUTCSS", "position"), (r"(?<![\w-])float\s*:", "LAYOUTCSS", "float"),
+                (r"display\s*:\s*(?:inline-)?(?:flex|grid)", "LAYOUTCSS", "flex/grid"), (r"calc\(", "LAYOUTCSS", "calc()"),
+                (r"var\(", "LAYOUTCSS", "var()"),
+                (r"(?:font-size|line-height|width|height|padding[\w-]*|margin[\w-]*|max-width|min-width)\s*:[^;}]*\d(?:rem|em|vw|vh)\b", "UNITS", "rem/em/vw/vh")]:
+                if re.search(pat, s, re.I) and (rule, label) not in seen:
+                    seen.add((rule, label)); self.add(rule, label, line)
+
+    def tables(self):
+        bad = []
+        for t in self.tag("table"):
+            has_th = any(n.tag == "th" for n in walk(t) if self.nearest_table(n) is t)
+            if has_th:
+                if t.attrs.get("role") == "presentation": self.add("TABLES", "data table has role=presentation", t.line, "WARN")
+                if any(n.tag == "th" and "scope" not in n.attrs for n in walk(t) if self.nearest_table(n) is t):
+                    self.add("TABLES", "<th> without scope", t.line, "WARN")
+            else:
+                miss = [k for k in ("cellpadding", "cellspacing", "border") if t.attrs.get(k) != "0"]
+                if t.attrs.get("role") != "presentation": miss.insert(0, "role=presentation")
+                if miss: bad.append((t.line, ",".join(miss)))
+        for line, m in bad[:3]: self.add("TABLES", f"missing {m}", line)
+        if len(bad) > 3: self.add("TABLES", f"...+{len(bad) - 3} more tables", None)
+
+    @staticmethod
+    def nearest_table(n):
+        p = n.parent
+        while p is not None and p.tag != "table": p = p.parent
+        return p
+
+    def mso(self):
+        o = len(re.findall(r"<!--\[if[^\]]*\]>", self.raw)); c = len(re.findall(r"<!\[endif\]-->", self.raw))
+        if o != c: self.add("MSO", f"{o} conditional openers vs {c} <![endif]-->")
+        if self.raw.count("<!--[if mso]>") and "PixelsPerInch" not in self.raw:
+            self.add("RESET", "MSO block present but no OfficeDocumentSettings/PixelsPerInch 96", status="WARN")
+
+    def wellformed(self):
+        for line, m in self.b.errors[:6]: self.add("WELLFORMED", m, line)
+        if len(self.b.errors) > 6: self.add("WELLFORMED", f"...+{len(self.b.errors) - 6} more")
+
+    def bgpair(self):
+        n_bad = 0
+        for n in self.nodes:
+            if n.tag in ("td", "table", "body"):
+                s = style_of(n); bg = parse_color(s.get("background-color", "")); at = parse_color(n.attrs.get("bgcolor", ""))
+                if (bg is None) != (at is None) and not (bg is None and "background-color" not in s and "bgcolor" not in n.attrs):
+                    if "{{" in s.get("background-color", "") + n.attrs.get("bgcolor", ""): continue
+                    n_bad += 1
+                    if n_bad <= 3: self.add("BGPAIR", f"<{n.tag}> has only one of bgcolor / background-color", n.line)
+        if n_bad > 3: self.add("BGPAIR", f"...+{n_bad - 3} more")
+
+    def reset(self):
+        for key, label in [("x-apple-data-detectors", "Apple data-detector override"), ("-webkit-text-size-adjust", "text-size-adjust"),
+                           ("mso-table-lspace", "mso-table-lspace/rspace"), ("x-apple-disable-message-reformatting", "x-apple-disable-message-reformatting meta"),
+                           ("format-detection", "format-detection meta")]:
+            if key not in self.raw: self.add("RESET", f"missing {label}")
+
+    def ghost(self):
+        big = [t for t in self.tag("table") if re.search(r"max-width\s*:\s*(\d+)px", t.attrs.get("style", ""))
+               and int(re.search(r"max-width\s*:\s*(\d+)px", t.attrs["style"]).group(1)) >= 480]
+        if big and "<!--[if mso]>" not in self.raw: self.add("GHOST", "container table has max-width but no <!--[if mso]> ghost table", big[0].line)
+
+    def fonts(self):
+        bad, nonsafe = 0, False
+        for n in self.nodes:
+            f = style_of(n).get("font-family")
+            if not f or "{{" in f: continue
+            fam = [x.strip().strip("'\"").lower() for x in f.split(",")]
+            if fam[-1] not in ("sans-serif", "serif", "monospace"):
+                bad += 1
+                if bad <= 3: self.add("FONTS", f"font-family '{f[:40]}' has no generic fallback", n.line)
+            if fam[0] not in WEBSAFE: nonsafe = True
+        if nonsafe and not re.search(r"\[if mso\]>[^\x00]*?font-family", self.raw):
+            self.add("FONTS", "web font first in stack but no MSO font override (classic Outlook falls back to Times New Roman)", status="WARN")
+
+    def preheader(self):
+        body = self.tag("body")
+        cand = None
+        if body:
+            for i, n in enumerate(walk(body[0])):
+                s = style_of(n)
+                if "none" in s.get("display", "") and "mso-hide" in n.attrs.get("style", "") and real(text_of(n)):
+                    cand = (i, n); break
+                if i > 6: break
+        if not cand: self.add("PREHEADER", "no hidden preheader within the first elements of <body>"); return
+        t = real(text_of(cand[1])); L = len(t)
+        self.metrics["preheader_chars"] = L
+        if not 40 <= L <= 130: self.add("PREHEADER", f"preheader is {L} real characters (need 40-130)", cand[1].line)
+        self.preheader_node = cand[1]
+
+    def buttons(self):
+        btns = []
+        for a in self.tag("a"):
+            s = style_of(a)
+            if "inline-block" in s.get("display", "") and parse_color(s.get("background-color", "")): btns.append((a, s))
+        vml = len(re.findall(r"<v:roundrect", self.raw))
+        if btns and vml < len(btns): self.add("BUTTON", f"{len(btns)} CSS buttons but {vml} VML roundrects", btns[0][0].line)
+        for a, s in btns:
+            pv = 0; m = re.match(r"([\d.]+)px(?:\s+([\d.]+)px)?", s.get("padding", ""))
+            if m: pv = float(m.group(1))
+            lh = re.match(r"([\d.]+)px", s.get("line-height", ""))
+            tot = 2 * pv + (float(lh.group(1)) if lh else 0)
+            if tot < 44: self.add("BUTTON", f"tap target ~{tot:.0f}px (<44) for '{real(text_of(a))[:30]}'", a.line)
+        self.metrics["buttons"] = len(btns)
+
+    def overflow(self):
+        W = self.a.container; bad = 0
+        for n in self.nodes:
+            ws = []
+            if re.fullmatch(r"\d+", n.attrs.get("width", "")): ws.append(int(n.attrs["width"]))
+            m = re.search(r"(?<![\w-])width\s*:\s*(\d+)px", n.attrs.get("style", ""))
+            if m: ws.append(int(m.group(1)))
+            if any(w > W for w in ws):
+                bad += 1
+                if bad <= 3: self.add("OVERFLOW", f"<{n.tag}> width {max(ws)} > container {W}", n.line)
+        if bad > 3: self.add("OVERFLOW", f"...+{bad - 3} more")
+
+    def text_rules(self):
+        small = fixed = 0
+        for n in self.nodes:
+            if n.tag in ("style", "title", "script", "head"): continue
+            t = real(own_text(n))
+            if not t or hidden(n): continue
+            s = style_of(n); m = re.match(r"([\d.]+)px", s.get("font-size", ""))
+            if m and float(m.group(1)) < 12: small += 1
+            if n.tag in ("td", "div", "p") and (re.search(r"(?<![\w-])height\s*:\s*\d+px", n.attrs.get("style", "")) or re.fullmatch(r"\d+", n.attrs.get("height", ""))):
+                fixed += 1
+                if fixed <= 2: self.add("FIXEDH", "fixed height on element with text", n.line)
+        if small: self.add("SMALLTEXT", f"{small} text elements under 12px")
+
+    def headings(self):
+        hs = [n for n in self.nodes if n.tag in ("h1", "h2", "h3", "h4", "h5", "h6")]
+        h1 = sum(1 for h in hs if h.tag == "h1"); self.metrics["h1"] = h1
+        if h1 != 1: self.add("HEADINGS", f"{h1} <h1> elements (need exactly 1)", hs[0].line if hs else None)
+        last = 0
+        for h in hs:
+            lv = int(h.tag[1])
+            if last and lv > last + 1: self.add("HEADINGS", f"<{h.tag}> follows <h{last}> (skipped level)", h.line); break
+            last = lv
+
+    def images(self):
+        imgs = self.tag("img"); self.metrics["images"] = len(imgs); bad = 0
+        for im in imgs:
+            at = im.attrs; src = at.get("src", ""); s = style_of(im)
+            probs = []
+            if "alt" not in at: probs.append("no alt")
+            if not re.fullmatch(r"\d+", at.get("width", "")) or not re.fullmatch(r"\d+", at.get("height", "")): probs.append("no numeric width/height")
+            if "block" not in s.get("display", ""): probs.append("no display:block")
+            if probs:
+                bad += 1
+                if bad <= 4: self.add("IMGS", ", ".join(probs), im.line, "FAIL" if "no alt" in probs or "no numeric width/height" in probs else "WARN")
+            alt = at.get("alt", "")
+            if re.match(r"(image|picture|photo) of\b", alt, re.I) or re.search(r"\.(jpe?g|png|gif)$", alt, re.I):
+                self.add("ALT", f"alt '{alt[:30]}'", im.line)
+            if src and "{{" not in src:
+                host = (urlparse(src).hostname or "")
+                if src.startswith("data:") or any(h in src for h in BAD_IMG_HOSTS): self.add("ASSETHOST", f"{src[:60]}", im.line)
+                elif src.lower().split("?")[0].endswith(BAD_IMG_EXT): self.add("ASSETHOST", f"unsupported format {src[-30:]}", im.line)
+                if "placeholder" in src.lower(): self.add("PLACEHOLDER", f"placeholder image {src[-40:]}", im.line)
+        if bad > 4: self.add("IMGS", f"...+{bad - 4} more")
+
+    # -- links
+    def links(self):
+        anchors = self.tag("a"); self.metrics["links"] = len(anchors); seen_unsub = False
+        urls = []
+        for a in anchors:
+            href = a.attrs.get("href", "").strip(); txt = real(text_of(a, alts=True)); low = href.lower()
+            if "unsubscribe" in low or "unsubscribe" in txt.lower(): seen_unsub = True
+            dyn = "{{" in href or "{%" in href
+            if not href or href == "#" or href.startswith("#"): self.add("URLS", "empty or # href", a.line); continue
+            if not txt: self.add("LINKTEXT", "link has no text or alt", a.line)
+            elif re.fullmatch(r"(click here|here|read more|more|learn more)\.?", txt.lower()): self.add("LINKTEXT", f"non-descriptive '{txt}'", a.line, "WARN")
+            if dyn: continue
+            if re.match(r"(javascript|data):", low): self.add("SHORTENER", f"{low[:20]} link", a.line); continue
+            if re.match(r"(mailto|tel|sms):", low): continue
+            p = urlparse(href)
+            if p.scheme != "https": self.add("URLS", f"'{href[:50]}' is not absolute https", a.line); continue
+            host = (p.hostname or "").lower()
+            if host in SHORTENERS: self.add("SHORTENER", host, a.line)
+            if "placeholder.invalid" in host: self.add("PLACEHOLDER", f"link {href[:50]}", a.line); continue
+            m = re.fullmatch(r"(?:https?://)?((?:[\w-]+\.)+[a-z]{2,})(?:/\S*)?", txt, re.I)
+            if m and m.group(1).lower().removeprefix("www.") != host.removeprefix("www."): self.add("MISMATCH", f"text '{txt[:30]}' vs href host {host}", a.line)
+            urls.append(href)
+        for n in self.nodes:
+            for k in ("src", "background"):
+                v = n.attrs.get(k, "")
+                if v and "{{" not in v and not v.startswith("https://") and n.tag != "a":
+                    self.add("URLS", f"{n.tag} {k}='{v[:40]}' is not absolute https", n.line)
+        if self.marketing and not (seen_unsub or re.search(r"\{\{[^}]*unsubscribe[^}]*\}\}", self.raw, re.I)):
+            self.add("UNSUB", "no unsubscribe link or tag found")
+        for m in re.finditer(r"\[PLACEHOLDER[^\]]*\]", self.raw): self.add("PLACEHOLDER", m.group(0)[:60])
+        self.urls = sorted(set(urls))
+
+    def liveness(self):
+        body = self.tag("body"); t = ""
+        if body:
+            parts = [own_text(n) for n in walk(body[0]) if n.tag not in ("style", "script") and not hidden(n)]
+            t = real(" ".join(parts))
+        self.metrics["text_chars"] = len(t)
+        if self.marketing and len(t) < 150: self.add("TEXTRATIO", f"only {len(t)} characters of live text")
+        pre = getattr(self, "preheader_node", None)
+        for n in self.nodes:
+            if n.tag in ("div", "span", "td", "p") and "none" in style_of(n).get("display", "") and real(text_of(n)) and n is not pre and not any(a is pre for a in anc(n)):
+                self.add("HIDDEN", "hidden text other than the preheader", n.line); break
+
+    def spamcopy(self):
+        body = self.tag("body")
+        if not body: return
+        t = real(" ".join(own_text(n) for n in walk(body[0]) if n.tag not in ("style", "script") and not hidden(n)))
+        t = re.sub(r"\{\{.*?\}\}|\{%.*?%\}", " ", t)
+        caps = [w for w in re.findall(r"\b[A-Z]{5,}\b", t) if w not in ("HTTPS", "UNSUBSCRIBE")]
+        hits = [p for p in ("act now", "100% free", "risk-free", "risk free", "no obligation", "winner", "you have been selected", "click below",
+                            "limited time only", "once in a lifetime", "cash bonus", "double your", "no credit check") if p in t.lower()]
+        if len(caps) > 3: self.add("SPAMCOPY", f"{len(caps)} ALL-CAPS words (e.g. {', '.join(caps[:3])})")
+        if re.search(r"!{3,}|\${2,}", t): self.add("SPAMCOPY", "repeated !!! or $$$")
+        if hits: self.add("SPAMCOPY", "trigger phrases: " + ", ".join(hits[:4]))
+
+    # -- contrast, dark
+    def contrast(self):
+        L, A, B, big = {}, {}, {}, 0
+        for n in self.nodes:
+            if n.tag in ("style", "title", "script", "head") or hidden(n): continue
+            t = real(own_text(n))
+            if not t or re.fullmatch(r"(\{\{.*?\}\}|\{%.*?%\}|\s)*", t): continue
+            fg, bg = eff_color(n), eff_bg(n); size, bold = font_info(n)
+            large = size >= 24 or (size >= 18.66 and bold); need = 3.0 if large else 4.5
+            for name, (f, b_) in {"light": (fg, bg),
+                                 "simA": (invert(fg) if lightness(fg) <= 0.4 else fg, invert(bg) if lightness(bg) >= 0.6 else bg),
+                                 "simB": (invert(fg), invert(bg))}.items():
+                r = ratio(f, b_)
+                d = {"light": L, "simA": A, "simB": B}[name]
+                k = (hexc(fg), hexc(bg), need)
+                if r < need and k not in d: d[k] = (round(r, 2), n.line)
+        self.metrics["contrast_fail_pairs"] = {"light": len(L), "simA": len(A), "simB": len(B)}
+        for label, d in (("light", L), ("simA", A), ("simB", B)):
+            for (fg, bg, need), (r, line) in list(d.items())[:3]:
+                self.add("CONTRAST", f"{label}: {fg} on {bg} = {r}:1 (need {need})", line)
+            if len(d) > 3: self.add("CONTRAST", f"{label}: ...+{len(d) - 3} more pairs")
+
+    def dark(self):
+        miss = []
+        if 'name="color-scheme"' not in self.raw: miss.append("color-scheme meta")
+        if 'name="supported-color-schemes"' not in self.raw: miss.append("supported-color-schemes meta")
+        if not re.search(r"@media\s*\(\s*prefers-color-scheme\s*:\s*dark\s*\)", self.css): miss.append("prefers-color-scheme:dark block")
+        if miss: self.add("DARKCFG", "missing " + ", ".join(miss))
+        if "[data-ogsc]" not in self.css: self.add("DARKCFG", "no [data-ogsc]/[data-ogsb] Outlook.com overrides", status="WARN")
+        if not re.search(r":root\s*\{[^}]*color-scheme", self.css): self.add("DARKCFG", "no :root{color-scheme} declaration", status="WARN")
+
+    def size(self):
+        a = self.a; size = len(self.raw.encode("utf-8")); style = len("".join(self.style_texts).encode("utf-8"))
+        est = size + self.metrics.get("links", 0) * a.tracking_overhead + a.extra_bytes
+        self.metrics.update(size_bytes=size, style_bytes=style, est_delivered_bytes=est)
+        if est > 102 * 1024: self.add("SIZE", f"estimated delivered {est / 1024:.1f} KB > 102 KB")
+        elif est > 90 * 1024: self.add("SIZE", f"estimated delivered {est / 1024:.1f} KB (soft target 90 KB)", status="WARN")
+        if style > 16 * 1024: self.add("STYLESIZE", f"<style> is {style / 1024:.1f} KB")
+
+    # -- jinja
+    def jinja(self):
+        raw = self.raw
+        toks = [(m.start(), m.group(0)) for m in re.finditer(r"\{\{.*?\}\}|\{%.*?%\}|\{#.*?#\}", raw, re.S)]
+        stripped = re.sub(r"\{\{.*?\}\}|\{%.*?%\}|\{#.*?#\}", "", raw, flags=re.S)
+        if "{{" in stripped or "{%" in stripped: self.add("JINJA-TOKEN", "unmatched {{ or {% delimiter")
+        line_of = lambda pos: raw.count("\n", 0, pos) + 1
+        depth = 0; nofb = []; allow = [re.compile(p, re.I) for p in self.a.allow_token]
+        for pos, t in toks:
+            inner = t[2:-2].strip()
+            if t.startswith("{%"):
+                w = inner.lstrip("-").strip().split(" ")[0]
+                if w == "if": depth += 1
+                elif w == "endif": depth = max(0, depth - 1)
+                if re.search(r"[<>]", inner): self.add("JINJA-TOKEN", f"raw < or > in tag: {t[:50]}", line_of(pos))
+            if t.startswith("{#"): continue
+            if "\n" in t: self.add("JINJA-TOKEN", "token spans lines", line_of(pos), "WARN")
+            if re.search(r"<\s*/?\s*[a-zA-Z]", t): self.add("JINJA-TOKEN", f"HTML inside token: {t[:50]}", line_of(pos))
+            if re.search(r"(?<![\w'\"])null(?![\w'\"])", inner): self.add("JINJA-TOKEN", "use false, not null", line_of(pos))
+            if t.startswith("{{"):
+                if "default(" in inner or SELF_TAGS.search(inner) or any(p.search(inner) for p in allow): continue
+                if re.match(r"^['\"][^'\"]*['\"]$", inner): continue
+                if depth == 0: nofb.append((line_of(pos), t))
+        for line, t in nofb[:5]: self.add("JINJA-FALLBACK", t[:60], line)
+        if len(nofb) > 5: self.add("JINJA-FALLBACK", f"...+{len(nofb) - 5} more")
+        self.metrics["jinja_tokens"] = len(toks)
+        if toks:
+            try:
+                import jinja2
+                try: jinja2.Environment().parse(raw)
+                except jinja2.TemplateSyntaxError as e:
+                    unk = "unknown tag" in str(e).lower()
+                    self.add("JINJA-SYNTAX", f"{e.message} (line {e.lineno})", e.lineno, "WARN" if unk else "FAIL")
+            except ImportError: self.metrics["jinja_parse"] = "skipped (jinja2 not installed)"
+            self.branches(raw, toks, line_of)
+
+    def branches(self, raw, toks, line_of):
+        nocomment = lambda s: re.sub(r"<!--.*?-->", "", s, flags=re.S)
+        stack = []; reported = 0
+        def counts(seg):
+            seg = nocomment(re.sub(r"\{\{.*?\}\}|\{%.*?%\}|\{#.*?#\}", "", seg, flags=re.S))
+            return {t: len(re.findall(rf"<{t}[\s>]", seg)) - len(re.findall(rf"</{t}>", seg)) for t in ("table", "tr", "td", "div")}
+        for pos, t in toks:
+            if not t.startswith("{%"): continue
+            w = t[2:-2].strip().lstrip("-").strip().split(" ")[0]
+            end = pos + len(t)
+            if w in ("if", "for"): stack.append([w, pos, end])
+            elif w in ("elif", "else", "endif", "endfor") and stack:
+                top = stack[-1]; seg = raw[top[2]:pos]; c = counts(seg)
+                bad = {k: v for k, v in c.items() if v}
+                if bad and reported < 3:
+                    self.add("JINJA-BRANCH", f"branch at line {line_of(top[1])} unbalanced {bad}", line_of(top[1])); reported += 1
+                if w in ("endif", "endfor"): stack.pop()
+                else: top[2] = end
+
+    # -- network
+    def linkcheck(self):
+        imgs = sorted({n.attrs["src"] for n in self.tag("img") if n.attrs.get("src", "").startswith("https://") and "{{" not in n.attrs["src"]})
+        def probe(u, is_img=False):
+            hdr = {"User-Agent": "MoEngageEmailQA/1.0"}
+            for method in ("HEAD", "GET"):
+                try:
+                    r = urllib.request.urlopen(urllib.request.Request(u, method=method, headers=hdr), timeout=10)
+                    ct = r.headers.get("Content-Type", "")
+                    if is_img and not ct.startswith("image/"): return (u, "bad", f"content-type {ct}")
+                    return (u, "ok", r.status)
+                except urllib.error.HTTPError as e:
+                    if e.code in (405, 501) and method == "HEAD": continue
+                    if e.code in (401, 403, 429, 999): return (u, "unverified", e.code)
+                    return (u, "bad", e.code)
+                except Exception as e: return (u, "unverified", type(e).__name__)
+            return (u, "unverified", "no response")
+        with cf.ThreadPoolExecutor(5) as ex:
+            res = list(ex.map(probe, self.urls)) + list(ex.map(lambda u: probe(u, True), imgs))
+        cnt = {"ok": 0, "unverified": 0, "bad": 0}
+        for u, st, info in res:
+            cnt[st] += 1
+            if st == "bad": self.add("LINKCHECK", f"{u[:70]} -> {info}")
+        self.metrics["linkcheck"] = cnt
+
+    def run(self):
+        for f in (self.shell, self.banned, self.tables, self.mso, self.wellformed, self.bgpair, self.reset, self.ghost,
+                  self.fonts, self.preheader, self.buttons, self.overflow, self.text_rules, self.headings, self.images,
+                  self.links, self.liveness, self.spamcopy, self.contrast, self.dark, self.size, self.jinja):
+            f()
+        if self.a.check_links: self.linkcheck()
+        return self
+
+# ---------------------------------------------------------------- main
+def qa_main():
+    p = argparse.ArgumentParser()
+    p.add_argument("file", nargs="?"); p.add_argument("--type", default="marketing", choices=["marketing", "transactional", "alert"])
+    p.add_argument("--container", type=int, default=600); p.add_argument("--tracking-overhead", type=int, default=120)
+    p.add_argument("--extra-bytes", type=int, default=0); p.add_argument("--check-links", action="store_true")
+    p.add_argument("--json"); p.add_argument("--allow-token", action="append", default=[])
+    p.add_argument("--rules", action="store_true"); p.add_argument("--explain")
+    a = p.parse_args()
+    if a.rules:
+        for k, (s, t, h) in RULES.items(): print(f"{k:15} {s:5} {t}: {h}")
+        return 0
+    if a.explain:
+        r = RULES.get(a.explain.upper()); print(f"{a.explain.upper()} [{r[0]}] {r[1]}: {r[2]}" if r else "unknown rule"); return 0
+    if not a.file: p.error("file required")
+    raw = open(a.file, encoding="utf-8").read()
+    q = QA(raw, a).run()
+    order = {"FAIL": 0, "SEND": 1, "WARN": 2}
+    items = sorted(q.items, key=lambda x: order.get(x[1], 3))
+    c = {k: sum(1 for i in items if i[1] == k) for k in order}
+    for rule, st, msg, line in items:
+        print(f"{st:4} {rule:15} {('L' + str(line) + ' ') if line else ''}{msg}")
+    m = q.metrics
+    print(f"-- {c['FAIL']} FAIL, {c['SEND']} SEND, {c['WARN']} WARN | {m['size_bytes'] / 1024:.1f} KB (est. delivered {m['est_delivered_bytes'] / 1024:.1f} KB), "
+          f"style {m['style_bytes'] / 1024:.1f} KB, {m.get('links', 0)} links, {m.get('images', 0)} images, {m.get('jinja_tokens', 0)} jinja tokens, "
+          f"contrast fails light/simA/simB {m['contrast_fail_pairs']['light']}/{m['contrast_fail_pairs']['simA']}/{m['contrast_fail_pairs']['simB']}")
+    if c["FAIL"] or c["SEND"] or c["WARN"]: print("Hints: emailkit qa --explain RULE")
+    if a.json: json.dump({"items": [dict(rule=r, status=s, msg=g, line=l) for r, s, g, l in items], "metrics": m, "counts": c}, open(a.json, "w"), indent=1, default=str)
+    return 1 if c["FAIL"] else 0
+
+# ===================== BUILD =====================
+SCHEMA = """spec = {meta, tokens?, sections[]}
+meta: {lang:'en', dir:'ltr', title, preheader (40-130 chars), width:600, type:'marketing|transactional|alert'}
+tokens (all optional; defaults = neutral palette): page_bg card_bg text muted accent btn_fg link rule
+  font:'sans|serif|mono'  font_name:'Inter' (design font, prepended to the fallback stack)
+  scale:{h1|h2|h3|p|sub|legal|label: {size,lh,wt,color?,ls?,tt?}}   btn:{radius,h,fs,wt,ph,border?}
+  dark:{page,card,text,muted,link,border}
+section (all take: style:{bg,pad:[t,r,b,l],align,<role>:{size,lh,wt,color,ls,tt}}):
+  header   {logo:{src,w,h,alt,dark_src?}, align?}
+  hero     {h1, sub?, image?:{src,w,h,alt}, bg_image?:{src,h,fallback}, button?:{label,url}}
+  text     {h2?, p:[str,...]}                     inline: [label](https://url)  **bold**  {{jinja}}
+  image    {src,w,h,alt,href?}                    alt "" = decorative
+  columns  {cols:[{image?,h3?,p?,link?:{label,url},button?:{label,url}},...] (2-3), widths?:[..]}
+  button   {label,url,align?}
+  table    {head:[..], rows:[[..]], right?:[col idx]}   real data table with <th scope>
+  divider  {} | spacer {h:24}
+  footer   {legal?, address?, links?:[{label,url}], unsubscribe?: url or platform tag}
+  raw      {html:'<tr>..</tr>'}                    escape hatch; use --snippet for patterns
+Strings may contain Jinja tokens; keep each token on one line with default('..') fallbacks."""
+
+DEF = dict(page_bg="#F4F5F7", card_bg="#FFFFFF", text="#1F2933", muted="#52606D", accent="#0B5FFF", btn_fg="#FFFFFF",
+           link="#0B5FFF", rule="#D9DEE3", font="sans", font_name=None,
+           scale=dict(h1=dict(size=28, lh=36, wt=700), h2=dict(size=20, lh=28, wt=700), h3=dict(size=16, lh=24, wt=700),
+                      p=dict(size=16, lh=24, wt=400), sub=dict(size=18, lh=28, wt=400), legal=dict(size=12, lh=18, wt=400),
+                      label=dict(size=14, lh=20, wt=700)),
+           btn=dict(radius=6, h=48, fs=16, wt=700, ph=24),
+           dark=dict(page="#1A1A1A", card="#242424", text="#F5F5F5", muted="#B8C1CC", link="#6FA0FF", border="#3A3F45"))
+STACKS = {"sans": "Arial, Helvetica, sans-serif", "serif": "Georgia, 'Times New Roman', serif", "mono": "'Courier New', Courier, monospace"}
+JTOK = re.compile(r"(\{\{.*?\}\}|\{%.*?%\}|\{#.*?#\})", re.S)
+EXAMPLE = r'''{
+ "meta": {
+  "lang": "en",
+  "dir": "ltr",
+  "title": "Spring Sale",
+  "preheader": "Save on spring essentials this week, with free delivery on orders over $50.",
+  "width": 600,
+  "type": "marketing"
+ },
+ "tokens": {
+  "font_name": "Inter"
+ },
+ "sections": [
+  {
+   "type": "header",
+   "logo": {
+    "src": "https://cdn.example.com/acme/logo@2x.png",
+    "w": 160,
+    "h": 40,
+    "alt": "Acme",
+    "dark_src": "https://cdn.example.com/acme/logo-dark@2x.png"
+   }
+  },
+  {
+   "type": "hero",
+   "h1": "Spring savings are here",
+   "sub": "Hi {{UserAttribute['First Name']|default('there', true)}}, your picks are on sale until Sunday.",
+   "button": {
+    "label": "Shop the sale",
+    "url": "https://www.example.com/sale"
+   }
+  },
+  {
+   "type": "image",
+   "src": "https://cdn.example.com/acme/hero@2x.jpg",
+   "w": 600,
+   "h": 300,
+   "alt": "Fresh spring produce in a basket"
+  },
+  {
+   "type": "text",
+   "h2": "Why you'll love it",
+   "p": [
+    "Fresh arrivals every week & free delivery over $50.",
+    "Read our [delivery policy](https://www.example.com/delivery) for details."
+   ]
+  },
+  {
+   "type": "columns",
+   "cols": [
+    {
+     "image": {
+      "src": "https://cdn.example.com/acme/a@2x.jpg",
+      "w": 260,
+      "h": 160,
+      "alt": "Berries"
+     },
+     "h3": "Berries",
+     "p": "Sweet and local.",
+     "link": {
+      "label": "Shop berries",
+      "url": "https://www.example.com/berries"
+     }
+    },
+    {
+     "image": {
+      "src": "https://cdn.example.com/acme/b@2x.jpg",
+      "w": 260,
+      "h": 160,
+      "alt": "Greens"
+     },
+     "h3": "Greens",
+     "p": "Crisp and fresh.",
+     "link": {
+      "label": "Shop greens",
+      "url": "https://www.example.com/greens"
+     }
+    }
+   ]
+  },
+  {
+   "type": "divider"
+  },
+  {
+   "type": "footer",
+   "legal": "You are receiving this email because you subscribed to Acme updates.",
+   "address": "[PLACEHOLDER: company postal address]",
+   "unsubscribe": "https://www.example.com/unsubscribe",
+   "links": [
+    {
+     "label": "Preferences",
+     "url": "https://www.example.com/prefs"
+    }
+   ]
+  }
+ ]
+}'''
+
+# ------------------------------------------------------------ helpers
+def merge(a, b):
+    o = dict(a)
+    for k, v in (b or {}).items(): o[k] = merge(o[k], v) if isinstance(v, dict) and isinstance(o.get(k), dict) else v
+    return o
+
+def esc(s):
+    parts = JTOK.split(str(s)); out = []
+    for i, p in enumerate(parts):
+        if i % 2: out.append(p); continue
+        p = re.sub(r"&(?!#?\w+;)", "&amp;", p).replace("<", "&lt;").replace(">", "&gt;")
+        out.append(p)
+    return "".join(out)
+
+def attr(s):
+    return "".join(p if i % 2 else p.replace('"', "&quot;") for i, p in enumerate(JTOK.split(str(s))))
+
+class B:
+    def __init__(self, spec):
+        self.meta = merge(dict(lang="en", dir="ltr", title="Email", preheader="", width=600, type="marketing"), spec.get("meta"))
+        self.t = merge(DEF, spec.get("tokens")); self.W = int(self.meta["width"]); self.spec = spec
+        fam = self.t["font"]; base = STACKS[fam]
+        self.stack = (f"'{self.t['font_name']}', " + base) if self.t.get("font_name") else base
+        self.cls = f"mx-{fam}"
+
+    # inline markup: [label](url), **bold**
+    def inl(self, s):
+        s = esc(s)
+        s = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+|mailto:[^)\s]+|tel:[^)\s]+|\{\{[^)]*?\}\})\)",
+                   lambda m: f'<a class="mx-link" href="{attr(m.group(2))}" style="color:{self.t["link"]};text-decoration:underline;">{m.group(1)}</a>', s)
+        return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
+
+    def ts(self, role, o=None):
+        d = merge(self.t["scale"][role], (o or {}).get(role))
+        color = d.get("color") or (self.t["muted"] if role in ("sub", "legal") else self.t["text"])
+        css = f"font-family:{self.stack};font-size:{d['size']}px;line-height:{d['lh']}px;font-weight:{d['wt']};color:{color};word-break:break-word;overflow-wrap:break-word;"
+        if d.get("ls"): css += f"letter-spacing:{d['ls']}px;"
+        if d.get("tt"): css += f"text-transform:{d['tt']};"
+        hook = "mx-tx-muted" if color.lower() == self.t["muted"].lower() else ("mx-tx" if color.lower() == self.t["text"].lower() else "")
+        return css, f"{self.cls} {hook}".strip()
+
+    def pad(self, st, default): p = (st or {}).get("pad", default); return f"{p[0]}px {p[1]}px {p[2]}px {p[3]}px"
+
+    def row(self, inner, st=None, pad=(24, 24, 24, 24), align="left"):
+        st = st or {}; bg = st.get("bg", self.t["card_bg"]); al = st.get("align", align)
+        hook = "mx-bg-card " if bg.lower() == self.t["card_bg"].lower() else ("mx-bg-page " if bg.lower() == self.t["page_bg"].lower() else "")
+        return (f'<tr><td class="{hook}mx-pad-m" bgcolor="{bg}" align="{al}" style="padding:{self.pad(st, pad)};background-color:{bg};">'
+                f'{inner}</td></tr>')
+
+    def text(self, tag, role, content, st=None, mb=0):
+        css, cls = self.ts(role, st)
+        return f'<{tag} class="{cls}" style="margin:0 0 {mb}px 0;{css}">{content}</{tag}>'
+
+    def img(self, i, st=None, fluid=True):
+        w, h = int(i["w"]), int(i["h"])
+        if w > self.W: h = round(h * self.W / w); w = self.W
+        css, _ = self.ts("p", st)
+        fs = "font-family:%s;font-size:14px;line-height:20px;color:%s;" % (self.stack, self.t["text"])
+        sty = f"display:block;border:0;width:100%;max-width:{w}px;height:auto;{fs}" if fluid else f"display:block;border:0;width:{w}px;height:{h}px;{fs}"
+        return f'<img src="{attr(i["src"])}" width="{w}" height="{h}" alt="{attr(i.get("alt", ""))}" style="{sty}">'
+
+    def button(self, b, align="center", full=False):
+        bt = self.t["btn"]; r, h, fs, wt, ph = bt["radius"], bt["h"], bt["fs"], bt["wt"], bt["ph"]
+        label = esc(b["label"]); n = len(re.sub(JTOK, "x" * 8, b["label"]))
+        w = int(b.get("w") or max(160, math.ceil(n * fs * 0.6) + 2 * ph)); arc = round(r / min(w, h) * 100)
+        bg, fg = self.t["accent"], self.t["btn_fg"]; bdr = bt.get("border", bg); bw = 0 if bdr == bg else 1
+        lh = fs + 8; pv = max(0, math.ceil((h - lh) / 2)); url = attr(b["url"])
+        return (f'<table role="presentation" cellpadding="0" cellspacing="0" border="0" align="{align}"><tr>'
+                f'<td align="center" bgcolor="{bg}" style="background-color:{bg};border-radius:{r}px;">'
+                f'<!--[if mso]><v:roundrect xmlns:v="urn:schemas-microsoft-com:vml" xmlns:w="urn:schemas-microsoft-com:office:word" href="{url}" '
+                f'style="height:{h}px;v-text-anchor:middle;width:{w}px;" arcsize="{arc}%" strokecolor="{bdr}" strokeweight="{bw}px" fillcolor="{bg}">'
+                f'<w:anchorlock/><center class="{self.cls}" style="color:{fg};font-family:{self.stack};font-size:{fs}px;font-weight:{wt};">{label}</center></v:roundrect><![endif]-->'
+                f'<!--[if !mso]><!-- --><a href="{url}" class="{self.cls}" style="display:inline-block;padding:{pv}px {ph}px;background-color:{bg};'
+                f'border:{bw}px solid {bdr};border-radius:{r}px;color:{fg};font-family:{self.stack};font-size:{fs}px;font-weight:{wt};line-height:{lh}px;'
+                f'text-align:center;text-decoration:none;mso-hide:all;">{label}</a><!--<![endif]--></td></tr></table>')
+
+    def spacer(self, n): return f'<tr><td height="{n}" style="height:{n}px;font-size:{n}px;line-height:{n}px;mso-line-height-rule:exactly;">&nbsp;</td></tr>'
+
+    # ---------------------------------------------------- sections
+    def s_header(self, s):
+        lg = s["logo"]; al = (s.get("style") or {}).get("align", s.get("align", "left"))
+        img = self.img(lg, fluid=False)
+        if lg.get("dark_src"):
+            d = dict(lg, src=lg["dark_src"])
+            img = (f'<span class="mx-light-only">{img}</span><!--[if !mso]><!-- --><div class="mx-dark-only" style="display:none;max-height:0;overflow:hidden;mso-hide:all;">'
+                   f'{self.img(d, fluid=False)}</div><!--<![endif]-->')
+        return self.row(img, s.get("style"), (24, 24, 16, 24), al)
+
+    def s_hero(self, s):
+        st = s.get("style"); al = (st or {}).get("align", "center"); parts = []
+        if s.get("image"): parts.append(f'<div style="margin:0 0 24px 0;">{self.img(s["image"], st)}</div>')
+        parts.append(self.text("h1", "h1", self.inl(s["h1"]), st, 12 if s.get("sub") or s.get("button") else 0))
+        if s.get("sub"): parts.append(self.text("p", "sub", self.inl(s["sub"]), st, 24 if s.get("button") else 0))
+        if s.get("button"): parts.append(self.button(s["button"], al))
+        inner = "".join(parts)
+        bi = s.get("bg_image")
+        if bi:
+            fb = bi.get("fallback", self.t["card_bg"]); H = int(bi.get("h", 360)); W = self.W
+            return (f'<tr><td background="{attr(bi["src"])}" bgcolor="{fb}" width="{W}" height="{H}" valign="middle" align="{al}" '
+                    f'style="background-color:{fb};background-image:url(\'{attr(bi["src"])}\');background-size:cover;background-position:center;">'
+                    f'<!--[if gte mso 9]><v:rect xmlns:v="urn:schemas-microsoft-com:vml" fill="true" stroke="false" style="width:{W}px;height:{H}px;">'
+                    f'<v:fill type="frame" src="{attr(bi["src"])}" color="{fb}"/><v:textbox style="mso-fit-shape-to-text:true" inset="0,0,0,0"><![endif]-->'
+                    f'<div><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td align="{al}" class="mx-pad-m" '
+                    f'style="padding:{self.pad(st, (40, 24, 40, 24))};">{inner}</td></tr></table></div><!--[if gte mso 9]></v:textbox></v:rect><![endif]--></td></tr>')
+        return self.row(inner, st, (40, 24, 40, 24), al)
+
+    def s_text(self, s):
+        st = s.get("style"); parts = []
+        if s.get("h2"): parts.append(self.text("h2", "h2", self.inl(s["h2"]), st, 12))
+        ps = s.get("p", []); ps = [ps] if isinstance(ps, str) else ps
+        for i, p in enumerate(ps): parts.append(self.text("p", "p", self.inl(p), st, 12 if i < len(ps) - 1 else 0))
+        return self.row("".join(parts), st)
+
+    def s_image(self, s):
+        im = self.img(s)
+        if s.get("href"): im = f'<a href="{attr(s["href"])}" style="text-decoration:none;">{im}</a>'
+        return f'<tr><td class="mx-bg-card" bgcolor="{self.t["card_bg"]}" style="padding:0;background-color:{self.t["card_bg"]};">{im}</td></tr>'
+
+    def s_columns(self, s):
+        cols = s["cols"]; n = len(cols); W = self.W; st = s.get("style")
+        widths = s.get("widths") or [W // n] * n; widths[-1] += W - sum(widths)
+        valign = "top"; out = [f'<tr><td class="mx-bg-card" bgcolor="{self.t["card_bg"]}" align="center" style="padding:0;font-size:0;line-height:0;background-color:{self.t["card_bg"]};">',
+                               f'<!--[if mso]><table role="presentation" width="{W}" cellpadding="0" cellspacing="0" border="0"><tr><td width="{widths[0]}" valign="{valign}"><![endif]-->']
+        for i, c in enumerate(cols):
+            w = widths[i]; parts = []
+            if c.get("image"):
+                im = dict(c["image"]); im["w"] = min(int(im["w"]), w - 24); parts.append(f'<div style="margin:0 0 12px 0;">{self.img(im, st)}</div>')
+            if c.get("h3"): parts.append(self.text("h3", "h3", self.inl(c["h3"]), st, 8))
+            if c.get("p"): parts.append(self.text("p", "p", self.inl(c["p"]), st, 12 if c.get("link") or c.get("button") else 0))
+            if c.get("link"): parts.append(self.text("p", "p", self.inl(f'[{c["link"]["label"]}]({c["link"]["url"]})'), st))
+            if c.get("button"): parts.append(self.button(c["button"], "left"))
+            out.append(f'<div class="mx-stack" style="display:inline-block;width:100%;max-width:{w}px;vertical-align:{valign};">'
+                       f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td style="padding:12px;">{"".join(parts)}</td></tr></table></div>')
+            out.append(f'<!--[if mso]></td><td width="{widths[i + 1]}" valign="{valign}"><![endif]-->' if i < n - 1 else '<!--[if mso]></td></tr></table><![endif]-->')
+        out.append("</td></tr>")
+        return "".join(out)
+
+    def s_button(self, s):
+        st = s.get("style"); al = s.get("align", (st or {}).get("align", "center"))
+        return self.row(self.button(s, al), st, (16, 24, 16, 24), al)
+
+    def s_table(self, s):
+        st = s.get("style"); right = set(s.get("right", [])); css, cls = self.ts("p", st); hcss, hcls = self.ts("label", st)
+        th = "".join(f'<th scope="col" align="{"right" if i in right else "left"}" class="{hcls}" style="padding:8px 0;border-bottom:1px solid {self.t["rule"]};{hcss}">{self.inl(h)}</th>' for i, h in enumerate(s["head"]))
+        body = []
+        for r in s["rows"]:
+            cells = [f'<th scope="row" align="left" class="{cls}" style="padding:8px 0;{css.replace("font-weight:400", "font-weight:400")}">{self.inl(r[0])}</th>']
+            cells += [f'<td align="{"right" if i in right else "left"}" class="{cls}" style="padding:8px 0;{css}">{self.inl(v)}</td>' for i, v in enumerate(r[1:], 1)]
+            body.append("<tr>" + "".join(cells) + "</tr>")
+        tbl = (f'<table cellpadding="0" cellspacing="0" border="0" width="100%" style="width:100%;"><thead><tr>{th}</tr></thead><tbody>{"".join(body)}</tbody></table>')
+        return self.row(tbl, st)
+
+    def s_divider(self, s):
+        return (f'<tr><td class="mx-bg-card" bgcolor="{self.t["card_bg"]}" style="padding:0 24px;background-color:{self.t["card_bg"]};">'
+                f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td height="0" class="mx-border" '
+                f'style="height:0;font-size:0;line-height:0;mso-line-height-rule:exactly;border-top:1px solid {self.t["rule"]};">&nbsp;</td></tr></table></td></tr>')
+
+    def s_spacer(self, s): return self.spacer(int(s.get("h", 24)))
+
+    def s_footer(self, s):
+        st = s.get("style") or {}; st = dict(st); st.setdefault("bg", self.t["page_bg"])
+        parts = []
+        if s.get("legal"): parts.append(self.text("p", "legal", self.inl(s["legal"]), st, 8))
+        addr = s.get("address") or ("[PLACEHOLDER: company postal address]" if self.meta["type"] == "marketing" else "")
+        if addr: parts.append(self.text("p", "legal", esc(addr), st, 8))
+        links = [f'[{l["label"]}]({l["url"]})' for l in s.get("links", [])]
+        un = s.get("unsubscribe") or ("https://placeholder.invalid/unsubscribe" if self.meta["type"] == "marketing" else None)
+        if un and self.meta["type"] != "transactional" and self.meta["type"] != "alert" or s.get("unsubscribe"): links.append(f"[Unsubscribe]({un})")
+        if links: parts.append(self.text("p", "legal", " &nbsp;·&nbsp; ".join(self.inl(x) for x in links), st))
+        return self.row("".join(parts), st, (24, 24, 24, 24), "center")
+
+    def s_raw(self, s): return s["html"]
+
+    # ---------------------------------------------------- document
+    def head(self):
+        m, t, d = self.meta, self.t, self.t["dark"]; W = self.W
+        return f'''<!DOCTYPE html>
+<html lang="{m['lang']}" dir="{m['dir']}" xmlns="http://www.w3.org/1999/xhtml" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="x-apple-disable-message-reformatting">
+<meta name="format-detection" content="telephone=no, date=no, address=no, email=no, url=no">
+<meta name="color-scheme" content="light dark">
+<meta name="supported-color-schemes" content="light dark">
+<title>{esc(m['title'])}</title>
+<!--[if mso]>
+<noscript><xml><o:OfficeDocumentSettings><o:AllowPNG/><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml></noscript>
+<style>.mx-sans{{font-family:Arial,Helvetica,sans-serif !important;}}.mx-serif{{font-family:Georgia,'Times New Roman',serif !important;}}.mx-mono{{font-family:'Courier New',Courier,monospace !important;}}</style>
+<![endif]-->
+<style>
+:root{{color-scheme:light dark;supported-color-schemes:light dark;}}
+body{{margin:0;padding:0;width:100%;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;}}
+table,td{{border-collapse:collapse;mso-table-lspace:0pt;mso-table-rspace:0pt;}}
+img{{border:0;outline:none;text-decoration:none;-ms-interpolation-mode:bicubic;}}
+a[x-apple-data-detectors]{{color:inherit !important;text-decoration:none !important;font-size:inherit !important;font-family:inherit !important;font-weight:inherit !important;line-height:inherit !important;}}
+u + #body a{{color:inherit;text-decoration:none;font-size:inherit;font-family:inherit;font-weight:inherit;line-height:inherit;}}
+@media screen and (max-width:599px){{.mx-full{{width:100% !important;max-width:100% !important;}}.mx-stack{{display:block !important;width:100% !important;max-width:100% !important;}}.mx-pad-m{{padding-left:16px !important;padding-right:16px !important;}}}}
+@media (prefers-color-scheme:dark){{
+.mx-bg-page{{background-color:{d['page']} !important;}}.mx-bg-card{{background-color:{d['card']} !important;}}
+.mx-tx{{color:{d['text']} !important;}}.mx-tx-muted{{color:{d['muted']} !important;}}.mx-link{{color:{d['link']} !important;}}.mx-border{{border-color:{d['border']} !important;}}
+.mx-light-only{{display:none !important;max-height:0 !important;overflow:hidden !important;mso-hide:all !important;}}
+.mx-dark-only{{display:block !important;max-height:none !important;overflow:visible !important;}}}}
+[data-ogsc] .mx-tx{{color:{d['text']} !important;}}[data-ogsc] .mx-tx-muted{{color:{d['muted']} !important;}}[data-ogsc] .mx-link{{color:{d['link']} !important;}}
+[data-ogsb] .mx-bg-page{{background-color:{d['page']} !important;}}[data-ogsb] .mx-bg-card{{background-color:{d['card']} !important;}}
+[data-ogsc] .mx-light-only{{display:none !important;}}[data-ogsc] .mx-dark-only{{display:block !important;max-height:none !important;overflow:visible !important;}}
+</style>
+</head>
+<body id="body" class="mx-bg-page" bgcolor="{t['page_bg']}" style="margin:0;padding:0;background-color:{t['page_bg']};">
+<div lang="{m['lang']}" dir="{m['dir']}" role="article" style="width:100%;">
+<div style="display:none;visibility:hidden;max-height:0px;max-width:0px;overflow:hidden;opacity:0;mso-hide:all;font-size:1px;line-height:1px;color:{t['page_bg']};">{esc(m['preheader'])}{"&zwnj;&nbsp;" * 24}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="mx-bg-page" bgcolor="{t['page_bg']}" style="width:100%;background-color:{t['page_bg']};">
+<tr><td align="center" style="padding:0;">
+<!--[if mso]><table role="presentation" align="center" width="{W}" cellpadding="0" cellspacing="0" border="0"><tr><td width="{W}"><![endif]-->
+<table role="presentation" width="{W}" cellpadding="0" cellspacing="0" border="0" align="center" class="mx-full" style="width:100%;max-width:{W}px;">
+'''
+
+    FOOT = '''</table>
+<!--[if mso]></td></tr></table><![endif]-->
+</td></tr></table>
+</div>
+</body>
+</html>
+'''
+
+    def build(self):
+        rows = []
+        for s in self.spec["sections"]:
+            fn = getattr(self, "s_" + s["type"], None)
+            if not fn: raise SystemExit(f"unknown section type: {s['type']}")
+            rows.append(fn(s))
+        return self.head() + "\n".join(rows) + "\n" + self.FOOT
+
+def build_main():
+    p = argparse.ArgumentParser(); p.add_argument("spec", nargs="?"); p.add_argument("out", nargs="?")
+    p.add_argument("--schema", action="store_true"); p.add_argument("--example", action="store_true"); p.add_argument("--snippet", nargs=2, metavar=("TYPE", "JSON")); p.add_argument("--tokens")
+    a = p.parse_args()
+    if a.schema: print(SCHEMA); return
+    if a.example: print(EXAMPLE); return
+    if a.snippet:
+        tok = json.load(open(a.tokens)) if a.tokens else {}
+        b = B({"meta": {}, "tokens": tok, "sections": []}); sec = json.loads(a.snippet[1]); sec["type"] = a.snippet[0]
+        print(getattr(b, "s_" + sec["type"])(sec)); return
+    if not (a.spec and a.out): p.error("spec and out required")
+    html = B(json.load(open(a.spec))).build(); open(a.out, "w", encoding="utf-8").write(html)
+    print(f"wrote {a.out}: {len(html.encode()) / 1024:.1f} KB")
+
+# ===================== RENDER =====================
+CONTRAST_JS = r"""() => {
+  const P = s => { const m = s.match(/rgba?\(([^)]+)\)/); if (!m) return null; const v = m[1].split(',').map(x => parseFloat(x));
+                   return {r: v[0], g: v[1], b: v[2], a: v.length > 3 ? v[3] : 1}; };
+  const L = c => { const f = x => { x /= 255; return x <= 0.04045 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4); };
+                   return 0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b); };
+  const R = (a, b) => { const x = L(a), y = L(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+  const bgOf = el => { for (let e = el; e; e = e.parentElement) { const c = P(getComputedStyle(e).backgroundColor);
+                        if (c && c.a > 0.95) return c; } return {r: 255, g: 255, b: 255, a: 1}; };
+  const out = [];
+  for (const el of document.querySelectorAll('body *')) {
+    if (['STYLE', 'SCRIPT', 'TITLE'].includes(el.tagName)) continue;
+    const own = [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('').replace(/[\s\u200c\u00a0]+/g, ' ').trim();
+    if (!own) continue;
+    const cs = getComputedStyle(el); if (cs.display === 'none' || cs.visibility === 'hidden' || el.offsetParent === null && cs.position !== 'fixed') continue;
+    const fg = P(cs.color), bg = bgOf(el); if (!fg) continue;
+    const size = parseFloat(cs.fontSize), bold = parseInt(cs.fontWeight) >= 600;
+    const need = (size >= 24 || (size >= 18.66 && bold)) ? 3 : 4.5, r = R(fg, bg);
+    if (r < need) out.push({text: own.slice(0, 28), ratio: Math.round(r * 100) / 100, need, fg: cs.color, bg: `rgb(${bg.r},${bg.g},${bg.b})`});
+  }
+  return out;
+}"""
+
+def resolve(html, ctx, notes):
+    try:
+        import jinja2
+        class D(dict):
+            def __missing__(self, k): return jinja2.Undefined(name=k)
+        base = {k: (D(v) if isinstance(v, dict) else v) for k, v in ctx.items()}
+        base.setdefault("UserAttribute", D())
+        return jinja2.Environment(undefined=jinja2.Undefined).from_string(html).render(**base)
+    except Exception as e:
+        notes.append(f"Jinja not resolved ({type(e).__name__}: {str(e)[:60]}); rendering raw tokens"); return html
+
+def render_main():
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print('SKIPPED render: playwright is not installed (python -m pip install playwright && python -m playwright install chromium)'); return 3
+    a = argparse.ArgumentParser(); a.add_argument("file"); a.add_argument("--widths", default="320,375,414,600,700")
+    a.add_argument("--shots"); a.add_argument("--vars"); a.add_argument("--load-images", action="store_true")
+    a.add_argument("--sbs", nargs=2, metavar=("REF", "OUT")); a.add_argument("--width", type=int, default=600)
+    o = a.parse_args(); fails = []; notes = []
+    html = resolve(open(o.file, encoding="utf-8").read(), json.load(open(o.vars)) if o.vars else {}, notes)
+
+    def route(r):
+        if o.load_images or r.request.url.startswith(("data:", "about:")): r.continue_()
+        else: r.abort()
+
+    with sync_playwright() as p:
+        try: b = p.chromium.launch()
+        except Exception as e:
+            print('SKIPPED render: Chromium cannot launch (' + str(e)[:80] + ')'); return 3
+        def page(w, scheme="light", mq=True, images=True):
+            ctx = b.new_context(viewport={"width": w, "height": 900}, color_scheme=scheme); pg = ctx.new_page()
+            pg.route("**/*", (lambda r: r.abort()) if not images else route)
+            pg.set_content(html, wait_until="load")
+            if not mq: pg.evaluate("document.querySelectorAll('style').forEach(s => s.textContent = '')")
+            return pg
+        if o.sbs:
+            from PIL import Image
+            pg = page(o.width); h = pg.evaluate("document.documentElement.scrollHeight"); pg.set_viewport_size({"width": o.width, "height": h})
+            pg.screenshot(path="/tmp/_render.png", full_page=True)
+            ref = Image.open(o.sbs[0]).convert("RGB"); rn = Image.open("/tmp/_render.png").convert("RGB")
+            ref = ref.resize((o.width, round(ref.height * o.width / ref.width)))
+            H = max(ref.height, rn.height); canvas = Image.new("RGB", (o.width * 2 + 20, H), (255, 0, 255))
+            canvas.paste(ref, (0, 0)); canvas.paste(rn, (o.width + 20, 0))
+            if canvas.height > 2400: canvas = canvas.crop((0, 0, canvas.width, 2400)); notes.append("side-by-side cropped to 2400px height")
+            canvas.save(o.sbs[1]); print(f"side-by-side (reference left, render right) -> {o.sbs[1]} {canvas.size}"); b.close(); return 0
+        for w in map(int, o.widths.split(",")):
+            pg = page(w); sw = pg.evaluate("document.documentElement.scrollWidth")
+            if sw > w: fails.append(f"overflow at {w}px: scrollWidth {sw}")
+            if o.shots and w in (375, 600): pg.screenshot(path=f"{o.shots}/light-{w}.png", full_page=True)
+        pg = page(375, mq=False); sw = pg.evaluate("document.documentElement.scrollWidth")
+        if sw > 375: fails.append(f"no-<style> stress: overflow at 375px ({sw})")
+        bad = pg.evaluate("""() => { let n = 0; document.querySelectorAll('tr').forEach(tr => {
+              const k = [...tr.querySelectorAll(':scope > td > div.mx-stack')]; for (let i = 1; i < k.length; i++)
+                 if (k[i].getBoundingClientRect().top < k[i-1].getBoundingClientRect().bottom - 1) n++; }); return n; }""")
+        if bad: fails.append(f"no-<style> stress: {bad} column group(s) do not stack")
+        pg = page(375, images=False); h = pg.evaluate("document.documentElement.scrollHeight"); sw = pg.evaluate("document.documentElement.scrollWidth")
+        if sw > 375: fails.append(f"images blocked: overflow at 375px ({sw})")
+        if h < 150: fails.append(f"images blocked: layout collapses (height {h}px)")
+        res = {}
+        for scheme in ("light", "dark"):
+            pg = page(375, scheme=scheme); res[scheme] = pg.evaluate(CONTRAST_JS)
+            if o.shots: pg.screenshot(path=f"{o.shots}/{scheme}-375-contrast.png", full_page=True)
+        b.close()
+    for scheme, lst in res.items():
+        seen = set()
+        for x in lst:
+            k = (x["fg"], x["bg"])
+            if k in seen: continue
+            seen.add(k)
+            if len(seen) <= 4: (fails if scheme == "dark" else notes).append(f"{scheme} contrast {x['ratio']}:1 (need {x['need']}) '{x['text']}' {x['fg']} on {x['bg']}")
+        if len(seen) > 4: notes.append(f"{scheme}: ...+{len(seen) - 4} more failing colour pairs")
+    for f in fails: print("FAIL", f)
+    for n in notes: print("NOTE", n)
+    print(f"-- {len(fails)} FAIL, {len(notes)} NOTE | widths {o.widths}; light/dark contrast fails: {len(res['light'])}/{len(res['dark'])}")
+    return 1 if fails else 0
+
+# ===================== MEASURE =====================
+def _mhex(c): return "#%02x%02x%02x" % tuple(int(x) for x in c)
+
+def measure_main():
+    try:
+        import numpy as np
+        from PIL import Image
+    except ImportError:
+        print('SKIPPED measure: Pillow and numpy are required (python -m pip install pillow numpy); use vision-only estimates'); return 3
+    a = argparse.ArgumentParser(); a.add_argument("file"); a.add_argument("--width", type=int, default=600)
+    a.add_argument("--crops"); a.add_argument("--gap", type=int, default=32); a.add_argument("--json"); o = a.parse_args()
+    im = Image.open(o.file).convert("RGB"); s = o.width / im.width
+    im = im.resize((o.width, max(1, round(im.height * s))), Image.LANCZOS); A = np.asarray(im).astype(int); H, W, _ = A.shape
+    edge = np.concatenate([A[:, :6], A[:, -6:]], axis=1).reshape(H, -1, 3)
+    row_bg = np.array([np.median(e, axis=0) for e in edge]).astype(int)
+    bands, start = [], 0
+    for y in range(1, H + 1):
+        if y == H or np.abs(row_bg[y] - row_bg[start]).max() > 8:
+            bands.append((start, y)); start = y
+    merged = []
+    for b in bands:  # merge slivers into neighbours
+        if merged and (b[1] - b[0] < 4 or merged[-1][1] - merged[-1][0] < 4) : merged[-1] = (merged[-1][0], b[1])
+        else: merged.append(b)
+    split = []  # split same-background bands at large blank gaps (cards stacked on one colour)
+    for (y0, y1) in merged:
+        blk = A[y0:y1]; bg = np.median(blk[:, :6].reshape(-1, 3), axis=0); rows = (np.abs(blk - bg).max(axis=2) > 28).any(axis=1)
+        cuts, run = [], 0
+        for k, on in enumerate(list(rows) + [True]):
+            if on:
+                if run >= o.gap and cuts is not None and k - run > 0 and rows[:k - run].any(): cuts.append(y0 + k - run // 2)
+                run = 0
+            else: run += 1
+        edges = [y0] + cuts + [y1]; split += [(edges[j], edges[j + 1]) for j in range(len(edges) - 1) if edges[j + 1] - edges[j] > 0]
+    merged = split
+    out = []
+    for i, (y0, y1) in enumerate(merged):
+        blk = A[y0:y1]; bg = np.median(blk[:, :6].reshape(-1, 3), axis=0)
+        ink = np.abs(blk - bg).max(axis=2) > 28
+        item = {"band": i, "y": [y0, y1], "h": y1 - y0, "bg": _mhex(bg)}
+        if ink.any():
+            ys, xs = np.where(ink); item["pad"] = [int(ys.min()), int(W - 1 - xs.max()), int(y1 - y0 - 1 - ys.max()), int(xs.min())]
+            colp = ink.any(axis=0); segs, st = [], None
+            for x in range(W + 1):
+                on = x < W and colp[x]
+                if on and st is None: st = x
+                if not on and st is not None:
+                    if segs and st - segs[-1][1] < 24: segs[-1][1] = x
+                    else: segs.append([st, x])
+                    st = None
+            item["columns"] = [[int(p), int(q)] for p, q in segs]
+            rowp = ink.any(axis=1); lines, st = [], None
+            for y in range(len(rowp) + 1):
+                on = y < len(rowp) and rowp[y]
+                if on and st is None: st = y
+                if not on and st is not None: lines.append((st, y)); st = None
+            item["lines"] = [{"top": int(t), "ink_h": int(b - t)} for t, b in lines[:8]]
+            if len(lines) > 1: item["line_pitch"] = [int(lines[k + 1][0] - lines[k][0]) for k in range(min(len(lines) - 1, 6))]
+            q = (blk[ink] // 16 * 16 + 8); vals, cnt = np.unique(q, axis=0, return_counts=True)
+            order = np.argsort(-cnt)[:3]; item["ink"] = [_mhex(vals[k]) for k in order]
+        else: item["empty"] = True
+        out.append(item)
+        if o.crops:
+            import os; os.makedirs(o.crops, exist_ok=True); im.crop((0, y0, W, y1)).save(f"{o.crops}/band{i:02d}.png")
+    print(f"{o.file}: scale {s:.3f} -> {W}x{H}, {len(out)} bands")
+    for it in out:
+        print(json.dumps(it, separators=(",", ":")))
+    if o.json: json.dump(out, open(o.json, "w"), indent=1)
+
+# ===================== PROBE / PLACEHOLDER / DISPATCH =====================
+def probe_main():
+    rows = [("python", "ON", platform.python_version())]
+    try:
+        import jinja2; rows.append(("jinja2", "ON", jinja2.__version__))
+    except ImportError: rows.append(("jinja2", "OFF", "syntax/fixture checks reduced"))
+    try:
+        import numpy, PIL; rows.append(("pillow+numpy", "ON", "screenshot measurement and --sbs available"))
+    except ImportError: rows.append(("pillow+numpy", "OFF", "pip install pillow numpy, or use vision-only estimates"))
+    try:
+        from playwright.sync_api import sync_playwright
+        try:
+            with sync_playwright() as p:
+                b = p.chromium.launch(); b.close()
+            rows.append(("renderer", "ON", "chromium launches"))
+        except Exception as e: rows.append(("renderer", "OFF", "chromium cannot launch: " + str(e)[:60]))
+    except ImportError: rows.append(("renderer", "OFF", "playwright not installed; render checks will be skipped"))
+    try:
+        r = urllib.request.urlopen(urllib.request.Request("https://www.caniemail.com", headers={"User-Agent": "emailkit"}), timeout=6)
+        rows.append(("network (bash)", "ON", f"HTTP {r.status}; --check-links usable"))
+    except Exception as e: rows.append(("network (bash)", "OFF", type(e).__name__ + "; use web_fetch for a few key links"))
+    rows.append(("writable cwd", "ON" if os.access(".", os.W_OK) else "OFF", os.getcwd()))
+    for k, v, n in rows: print(f"{k:16} {v:4} {n}")
+    return 0
+
+def placeholder_main():
+    a = argparse.ArgumentParser(); a.add_argument("w", type=int); a.add_argument("h", type=int); a.add_argument("out")
+    a.add_argument("--scale", type=int, default=2); a.add_argument("--color", default="D9DEE3"); o = a.parse_args()
+    W, H = o.w * o.scale, o.h * o.scale; c = bytes.fromhex(o.color.lstrip("#"))
+    raw = (b"\x00" + c * W) * H
+    def chunk(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b"")
+    open(o.out, "wb").write(png); print(f"{o.out}: {W}x{H}px, {len(png)} bytes"); return 0
+
+def main():
+    cmds = {"build": build_main, "qa": qa_main, "render": render_main, "measure": measure_main, "probe": probe_main, "placeholder": placeholder_main}
+    if len(sys.argv) < 2 or sys.argv[1] not in cmds:
+        print(__doc__); return 2
+    cmd = sys.argv[1]; sys.argv = [f"emailkit {cmd}"] + sys.argv[2:]
+    return cmds[cmd]() or 0
+
+if __name__ == "__main__":
+    sys.exit(main())
